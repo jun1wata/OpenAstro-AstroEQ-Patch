@@ -496,27 +496,11 @@ README_ja.md
 
 # 13. ASIAIR Proはインターネットへ接続しない
 
-以前の手順にあった、
-
-```bash
-sudo apt update
-```
-
-や、
-
-```bash
-git clone https://...
-```
-
-は、このオフライン手順では使用しません。
-
-また、
-
 ```text
-家庭のWi-Fiへ接続
+ASIAIR Pro を家庭のWi-FiやLANケーブルと接続
 ```
 
-する必要もありません。
+する必要はありません。
 
 OpenAstro SDカード内にあるソースコードをそのまま使います。
 
