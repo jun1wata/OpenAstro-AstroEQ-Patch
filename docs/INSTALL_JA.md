@@ -41,7 +41,7 @@ OpenAstro_AstroEQ_public_release.zip
 11. PCを再びOpenAstro Wi-Fiへ接続する
 12. PCのブラウザからAstroEQを設定する
 
-## このパッチを適用するOpenAstroイメージ
+# このパッチを適用するOpenAstroイメージ
 このAstroEQ対応パッチは、ZWO ASIAIR Pro用として公開されている OpenAstro for ZWO ASIAIR Pro v1.0.0 イメージに適用します。
 OpenAstro ASIAIR Pro用イメージの公開ページ：
 https://github.com/open-astro/openastro-zwo-asiar-pro/releases
@@ -99,10 +99,10 @@ ASIAIR Pro
 - Windows PC
 - ASIAIR Pro用12V電源
 - Wi-Fi機能を持つWindows PC
-- OpenAstro Raspberry Pi用イメージ OpenAstro for ZWO ASIAIR Pro v1.0.0
-- AstroEQ公開パッチZIP
+- OpenAstro ZWO ASIAIR pro用イメージ OpenAstro for ZWO ASIAIR Pro v1.0.0
+- AstroEQ 対応パッチZIP
 
-今回使用するパッチZIP：
+今回使用する AstroEQ 対応パッチZIP：
 
 ```text
 OpenAstro_AstroEQ_public_release.zip
