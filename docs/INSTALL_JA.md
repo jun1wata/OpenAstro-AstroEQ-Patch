@@ -41,6 +41,14 @@ OpenAstro_AstroEQ_public_release.zip
 11. PCを再びOpenAstro Wi-Fiへ接続する
 12. PCのブラウザからAstroEQを設定する
 
+## このパッチを適用するOpenAstroイメージ
+このAstroEQ対応パッチは、ZWO ASIAIR Pro用として公開されている OpenAstro for ZWO ASIAIR Pro v1.0.0 イメージに適用します。
+OpenAstro ASIAIR Pro用イメージの公開ページ：
+https://github.com/open-astro/openastro-zwo-asiar-pro/releases
+まず上記ページからASIAIR Pro用OpenAstroイメージ OpenAstro for ZWO ASIAIR Pro v1.0.0 をWindows PCへダウンロードし、別のmicroSDカードへ書き込みます。
+そのmicroSDカードからASIAIR ProをOpenAstroで起動した後、本リポジトリで配布している `OpenAstro_AstroEQ_public_release.zip` をPCからASIAIR Proへ転送し、AstroEQパッチを適用します。
+**ZWO純正ASIAIRのmicroSDカードや純正システムへ直接このパッチを適用しないでください。**
+ZWO純正microSDカードはそのまま保存し、OpenAstro専用の別microSDカードを使用してください。
 ---
 
 # 2. 重要：ASIAIR Proはインターネットへ接続しない
@@ -91,7 +99,7 @@ ASIAIR Pro
 - Windows PC
 - ASIAIR Pro用12V電源
 - Wi-Fi機能を持つWindows PC
-- OpenAstro Raspberry Pi用イメージ
+- OpenAstro Raspberry Pi用イメージ OpenAstro for ZWO ASIAIR Pro v1.0.0
 - AstroEQ公開パッチZIP
 
 今回使用するパッチZIP：
@@ -146,19 +154,13 @@ ZWO純正カードを戻す
 
 ## 5-1. PCへOpenAstroイメージをダウンロードしておく
 
-インターネット接続可能なWindows PCを使用して、OpenAstro Raspberry Pi版のイメージをあらかじめダウンロードします。
-
-例えば、
+インターネット接続可能なWindows PCを使用して、のpenAstro for ZWO ASIAIR Pro v1.0.0イメージをあらかじめダウンロードします。
 
 ```text
-openastro-raspberrypi.img.xz
+openastro-zwo-asiair-pro.img.xz
 ```
 
-のようなイメージファイルです。
-
-**これはASIAIR Proからダウンロードするのではありません。**
-
-PCからダウンロードします。
+のイメージファイルです。
 
 ---
 
