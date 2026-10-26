@@ -111,18 +111,10 @@ OpenAstro_AstroEQ_public_release.zip
 例えばWindows PCの、
 
 ```text
-C:\Users\junn\Downloads\
+C:\Users\username\Downloads\
 ```
 
 へ保存しておきます。
-
-するとファイルは、
-
-```text
-C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip
-```
-
-となります。
 
 ---
 
@@ -275,7 +267,7 @@ WindowsでPowerShellを開きます。
 Windows PowerShell：
 
 ```text
-PS C:\Users\junn>
+PS C:\Users\username>
 ```
 
 ASIAIR Pro：
@@ -343,7 +335,7 @@ astro@openastro:~ $
 例えば、
 
 ```text
-C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip
+C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip
 ```
 
 です。
@@ -363,7 +355,7 @@ astro@openastro:~ $
 必ずWindows側の、
 
 ```text
-PS C:\Users\junn>
+PS C:\Users\username>
 ```
 
 で実行します。
@@ -375,7 +367,7 @@ PS C:\Users\junn>
 Windows PowerShellで1行で入力します。
 
 ```powershell
-scp C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
+scp C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
 ```
 
 パスワードを聞かれたら、
@@ -390,7 +382,7 @@ astro
 
 ```text
 Windows PC
-C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip
+C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip
 ```
 
 から、
@@ -407,13 +399,13 @@ ASIAIR Pro
 SSH秘密鍵を、
 
 ```text
-C:\Users\junn\.ssh\openastro_codex
+C:\Users\username\.ssh\openastro_codex
 ```
 
 に置いている場合は、
 
 ```powershell
-scp -i C:\Users\junn\.ssh\openastro_codex C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
+scp -i C:\Users\username\.ssh\openastro_codex C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
 ```
 
 とします。
@@ -582,7 +574,7 @@ git log --oneline -5
 
 も確認します。
 
-今回のAstroEQ公開パッチは、
+今回のAstroEQ対応パッチは、
 
 ```text
 77a618b
@@ -883,7 +875,7 @@ ssh astro@172.24.1.1
 SSH鍵を使う場合は、
 
 ```powershell
-ssh -i C:\Users\junn\.ssh\openastro_codex astro@172.24.1.1
+ssh -i C:\Users\username\.ssh\openastro_codex astro@172.24.1.1
 ```
 
 です。
@@ -1140,7 +1132,7 @@ ssh astro@172.24.1.1
 や、
 
 ```powershell
-scp C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
+scp C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
 ```
 
 です。
@@ -1254,7 +1246,7 @@ ssh astro@172.24.1.1
 ZIP転送：
 
 ```powershell
-scp C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
+scp C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
 ```
 
 標準OpenAstro：
