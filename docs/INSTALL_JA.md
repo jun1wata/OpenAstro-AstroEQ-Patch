@@ -405,7 +405,7 @@ C:\Users\username\.ssh\openastro_codex
 に置いている場合は、
 
 ```powershell
-scp -i C:\Users\username\.ssh\openastro_codex C:\Users\junn\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
+scp -i C:\Users\username\.ssh\openastro_codex C:\Users\username\Downloads\OpenAstro_AstroEQ_public_release.zip astro@172.24.1.1:/home/astro/
 ```
 
 とします。
