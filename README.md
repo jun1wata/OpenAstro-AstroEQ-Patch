@@ -10,7 +10,7 @@ https://github.com/open-astro/AlpacaBridge
 
 ## Target OpenAstro Image
 
-This patch is intended for the **OpenAstro image for ZWO ASIAIR Pro** distributed from:
+This patch is intended for the **OpenAstro image for ZWO ASIAIR Pro v1.0.0** distributed from:
 
 https://github.com/open-astro/openastro-zwo-asiar-pro/releases
 
