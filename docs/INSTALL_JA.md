@@ -12,7 +12,7 @@
 
 ```text
 Windows PC
-   ↓ Wi-Fi直接接続
+   ↓ Wi-Fi接続
 ASIAIR Pro / OpenAstro
 ```
 
