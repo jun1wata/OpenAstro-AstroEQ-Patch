@@ -497,10 +497,8 @@ README_ja.md
 # 13. ASIAIR Proはインターネットへ接続しない
 
 ```text
-ASIAIR Pro を家庭のWi-FiやLANケーブルと接続
+ASIAIR Pro を家庭のWi-FiやLANケーブルと接続する必要はありません。
 ```
-
-する必要はありません。
 
 OpenAstro SDカード内にあるソースコードをそのまま使います。
 
