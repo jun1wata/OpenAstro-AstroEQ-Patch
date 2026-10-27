@@ -1,0 +1,2286 @@
+diff --git a/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h b/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h
+index 32b9c983ff6a6883328482f919ca105ba85de360..84c64e3490c365773d15072a7434e6fdc8cc5eb4 100644
+--- a/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h
++++ b/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h
+@@ -44,6 +44,11 @@ std::vector<SkyWatcherHostInfo> discover_skywatcher_hosts(int timeout_ms = 1500)
+ 
+ enum class ConnectionType : std::uint8_t { Serial, Network };
+ 
++enum class GotoTargetMode : std::uint8_t {
++    Absolute,     // Wave and other controllers using ":S"
++    Incremental,  // AstroEQ runtime protocol using ":H"
++};
++
+ struct ConnectionInfo {
+     ConnectionType type = ConnectionType::Serial;
+ 
+@@ -57,6 +62,10 @@ struct ConnectionInfo {
+ 
+     // Per-command response timeout
+     int response_timeout_ms = 1000;
++
++    // Default stays compatible with Wave mounts. AstroEQ test instances opt
++    // into the incremental target command explicitly.
++    GotoTargetMode goto_target_mode = GotoTargetMode::Absolute;
+ };
+ 
+ // Axis channel words per the MC command set: "1" = RA/Az, "2" = Dec/Alt.
+@@ -65,6 +74,7 @@ inline constexpr int kAxisDec = 2;
+ 
+ // Decoded ":f" status reply.
+ struct AxisStatus {
++    std::string raw;
+     bool speed_mode = false;  // true = Speed(Tracking) mode, false = GOTO mode
+     bool ccw = false;         // true = rotating in the decreasing-counts direction
+     bool fast = false;        // true = high-speed slewing
+@@ -108,6 +118,7 @@ public:
+     void initialization_done(int axis);                         // ":F"
+     void set_motion_mode(int axis, char mode, char direction);  // ":G"
+     void set_goto_target(int axis, uint32_t counts);            // ":S"
++    void set_goto_target_increment(int axis, uint32_t counts);  // ":H"
+     void set_step_period(int axis, uint32_t t1_preset);         // ":I"
+     void start_motion(int axis);                                // ":J"
+     void stop_motion(int axis);                                 // ":K"
+diff --git a/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h b/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h
+index ba3c99f494455b6ef1a1eac7b62c8c420d67c1da..58ec70fb62ea742b3396cfed7ce3da41118f24f2 100644
+--- a/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h
++++ b/AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h
+@@ -20,6 +20,10 @@
+ 
+ namespace alpacacore::vendor::skywatcher {
+ 
++// Signed shortest move from current to target in the controller's 24-bit
++// counter space, reduced to the nearest equivalent CPR phase.
++int32_t compute_goto_delta_counts(uint32_t current_counts, uint32_t target_counts, uint32_t counts_per_revolution);
++
+ // Driver for Sky-Watcher mounts spoken to directly at the motor controller
+ // level (Wave 100i/150i over USB serial or built-in Wi-Fi UDP). Equatorial
+ // mode only. Unlike the SynScan hand-controller driver, all pointing math
+diff --git a/AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp b/AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp
+index 263daa8f873c5b7fa06f79d56c3e03570aaab70e..42f1b9c9a20ee3de36ef80781e46b0be349aaa01 100644
+--- a/AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp
++++ b/AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp
+@@ -36,6 +36,7 @@
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <set>
+@@ -54,6 +55,50 @@ constexpr char kReplyError = '!';
+ // response per datagram) — retransmit a bounded number of times on timeout.
+ constexpr int kUdpRetries = 3;
+ 
++bool protocol_trace_enabled() {
++    const char* value = std::getenv("ALPACACORE_SKYWATCHER_PROTOCOL_TRACE");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
++
++bool protocol_trace_command(char command) {
++    switch (command) {
++        case 'G':
++        case 'H':
++        case 'J':
++        case 'K':
++        case 'f':
++        case 'j':
++            return true;
++        default:
++            return false;
++    }
++}
++
++std::string escape_protocol_trace(const std::string& value) {
++    std::string escaped;
++    escaped.reserve(value.size() + 4);
++    for (char ch : value) {
++        switch (ch) {
++            case '\r':
++                escaped += "\\r";
++                break;
++            case '\n':
++                escaped += "\\n";
++                break;
++            case '\\':
++                escaped += "\\\\";
++                break;
++            case '"':
++                escaped += "\\\"";
++                break;
++            default:
++                escaped.push_back(ch);
++                break;
++        }
++    }
++    return escaped;
++}
++
+ int hex_nibble(char c) {
+     if (c >= '0' && c <= '9') return c - '0';
+     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+@@ -177,6 +222,24 @@ uint32_t SkyWatcherProtocolWrapper::decode_u24(const std::string& data) {
+ namespace {
+ 
+ #ifndef _WIN32
++bool skywatcher_serial_candidate(const alpacacore::util::UsbTtyDescriptor& descriptor) {
++    // A signature admits a port to probing, never directly to the results.
++    // Share patterns with by-id so Arduino's mangled names and raw USB
++    // manufacturer/product strings follow the same discovery policy.
++    return alpacacore::util::usb_tty_descriptor_matches(descriptor,
++        {"STM32", "STMicroelectronics", "0483", "Prolific", "PL2303", "067b", "FTDI", "CP210",
++         "CH340", "CH341", "1a86", "Silicon_Labs", "USB_Serial", "USB-Serial",
++         "Arduino", "Arduino SA", "2341", "Mega", "Mega_2560"});
++}
++
++std::string parse_skywatcher_serial_probe_reply(const std::string& reply) {
++    if (reply.size() != 7 || reply[0] != kReplyOk) {
++        return "";
++    }
++    // No "unknown" success: six valid MC-version hex digits are required.
++    return format_mc_version(reply.substr(1));
++}
++
+ // Open a serial port at 9600 8N1 and probe it with ":e1\r". Returns the motor
+ // board version string on success, empty on failure.
+ std::string probe_skywatcher_port(const std::string& port_path, int baud_rate) {
+@@ -220,44 +283,51 @@ std::string probe_skywatcher_port(const std::string& port_path, int baud_rate) {
+         close(fd);
+         return "";
+     }
+-    tcflush(fd, TCIOFLUSH);
+-
+-    const char probe[] = ":e1\r";
+-    if (!util::write_all(fd, probe, sizeof(probe) - 1)) {
+-        close(fd);
+-        return "";
+-    }
+-
+-    std::string reply;
+-    auto start = std::chrono::steady_clock::now();
+-    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
+-        char ch = 0;
+-        ssize_t r = read(fd, &ch, 1);
+-        if (r == 1) {
+-            if (ch == kFrameEnd) break;
+-            reply.push_back(ch);
+-            if (reply.size() > 16) break;
+-        } else if (r < 0 && errno != EAGAIN && errno != EINTR) {
+-            break;
++    // Arduino CDC controllers may reset on open. Keep the SAME descriptor
++    // open and retry once after a boot grace period; Wave's first successful
++    // response returns immediately without an extra delay or query.
++    for (int attempt = 0; attempt < 2; ++attempt) {
++        tcflush(fd, TCIOFLUSH);
++        const char probe[] = ":e1\r";
++        if (!util::write_all(fd, probe, sizeof(probe) - 1)) {
++            close(fd);
++            return "";
++        }
++        std::string reply;
++        bool terminated = false;
++        const auto start = std::chrono::steady_clock::now();
++        while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(1500)) {
++            char ch = 0;
++            ssize_t r = read(fd, &ch, 1);
++            if (r == 1) {
++                if (ch == kFrameEnd) {
++                    terminated = true;
++                    break;
++                }
++                reply.push_back(ch);
++                if (reply.size() > 16) break;
++            } else if (r < 0 && errno != EAGAIN && errno != EINTR) {
++                close(fd);
++                return "";
++            }
++        }
++        const std::string version = terminated ? parse_skywatcher_serial_probe_reply(reply) : "";
++        if (!version.empty()) {
++            close(fd);
++            return version;
++        }
++        if (attempt == 0) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+         }
+     }
+     close(fd);
+-
+-    if (reply.size() < 7 || reply[0] != kReplyOk) {
+-        return "";
+-    }
+-    std::string version = format_mc_version(reply.substr(1));
+-    return version.empty() ? "unknown" : version;
++    return "";
+ }
+ 
+ bool raw_port_looks_like_skywatcher_candidate(const std::string& port_path) {
+     auto descriptor = alpacacore::util::read_raw_tty_usb_descriptor(port_path);
+     if (!descriptor) return false;
+-    // Wave-series mounts expose an STM32 CDC-ACM virtual COM port (0483:5740,
+-    // /dev/ttyACM*); also accept the classic EQDIRECT cable chips.
+-    return alpacacore::util::usb_tty_descriptor_matches(
+-        *descriptor, {"STM32", "STMicroelectronics", "0483", "Prolific", "PL2303", "067b", "FTDI", "CP210", "CH340",
+-                      "CH341", "1a86", "Silicon_Labs", "USB_Serial", "USB-Serial"});
++    return skywatcher_serial_candidate(*descriptor);
+ }
+ #endif  // _WIN32
+ 
+@@ -273,13 +343,7 @@ std::vector<SkyWatcherPortInfo> enumerate_skywatcher_ports() {
+     if (alpacacore::util::path_exists(serial_by_id)) {
+         for (const auto& sym : alpacacore::util::list_serial_by_id(serial_by_id)) {
+             const std::string& name = sym.name;
+-            bool is_candidate =
+-                (name.find("STM32") != std::string::npos) || (name.find("STMicroelectronics") != std::string::npos) ||
+-                (name.find("Prolific") != std::string::npos) || (name.find("PL2303") != std::string::npos) ||
+-                (name.find("067b") != std::string::npos) || (name.find("FTDI") != std::string::npos) ||
+-                (name.find("CP210") != std::string::npos) || (name.find("CH340") != std::string::npos) ||
+-                (name.find("1a86") != std::string::npos) || (name.find("Silicon_Labs") != std::string::npos) ||
+-                (name.find("USB_Serial") != std::string::npos) || (name.find("USB-Serial") != std::string::npos);
++            const bool is_candidate = skywatcher_serial_candidate({"", name, ""});
+             if (!is_candidate) continue;
+ 
+             std::error_code canon_ec;
+@@ -920,8 +984,28 @@ std::string SkyWatcherProtocolWrapper::send_command(char command, int axis, cons
+     frame.append(data);
+     frame.push_back(kFrameEnd);
+ 
++    const bool trace = protocol_trace_enabled() && protocol_trace_command(command);
++    if (trace) {
++        ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][ProtocolTrace] TX axis=" + std::to_string(axis) +
++                                            " cmd=" + std::string(1, command) + " frame=\"" +
++                                            escape_protocol_trace(frame) + "\"");
++    }
++
+     int timeout = timeout_ms_override > 0 ? timeout_ms_override : pimpl_->default_timeout();
+     std::string reply = pimpl_->exchange(frame, timeout, expected_reply_data_len(command));
++    if (trace) {
++        std::string message = "[SkyWatcher][ProtocolTrace] RX axis=" + std::to_string(axis) +
++                              " cmd=" + std::string(1, command) + " raw=\"" +
++                              escape_protocol_trace(reply) + "\"";
++        if (command == 'j' && reply.size() >= 7 && reply[0] == kReplyOk) {
++            try {
++                message += " decoded_counts=" + std::to_string(decode_u24(reply.substr(1)));
++            } catch (const AlpacaException&) {
++                // Preserve existing validation behavior; send_command's caller performs the authoritative decode.
++            }
++        }
++        ALPACA_LOG_WARN("SkyWatcher", message);
++    }
+     if (!reply.empty() && reply[0] == kReplyOk) {
+         return reply.substr(1);
+     }
+@@ -975,6 +1059,7 @@ AxisStatus SkyWatcherProtocolWrapper::inquire_status(int axis) {
+         throw AlpacaException("Non-hex status reply: '" + data + "'");
+     }
+     AxisStatus status;
++    status.raw = data;
+     status.speed_mode = (n0 & 0x1) != 0;
+     status.ccw = (n0 & 0x2) != 0;
+     status.fast = (n0 & 0x4) != 0;
+@@ -997,6 +1082,10 @@ void SkyWatcherProtocolWrapper::set_goto_target(int axis, uint32_t counts) {
+     send_command('S', axis, encode_u24(counts));
+ }
+ 
++void SkyWatcherProtocolWrapper::set_goto_target_increment(int axis, uint32_t counts) {
++    send_command('H', axis, encode_u24(counts));
++}
++
+ void SkyWatcherProtocolWrapper::set_step_period(int axis, uint32_t t1_preset) {
+     send_command('I', axis, encode_u24(t1_preset));
+ }
+diff --git a/AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp b/AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp
+index c0a2f629ea3f07164ac919577ca8cdb32828eed2..ab4042c69c4c32ca287d074fa1cbc983fc6e2b32 100644
+--- a/AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp
++++ b/AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp
+@@ -24,9 +24,11 @@
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
++#include <cstdlib>
+ #include <mutex>
+ #include <numbers>
+ #include <optional>
++#include <string_view>
+ #include <thread>
+ 
+ namespace alpacacore::vendor::skywatcher {
+@@ -130,8 +132,174 @@ uint32_t degrees_to_counts(double degrees, uint32_t cpr) {
+     return (kHomeCounts + static_cast<uint32_t>(delta)) & kCountsMask;
+ }
+ 
++// AstroEQ uses the same inverse for live coordinates and GoTo validation.
++std::pair<double, double> astroeq_axes_to_equatorial(double a1, double a2,
++                                                   double lst, bool south) {
++    const double dec_mech = a2 >= 0.0 ? 90.0 - a2 : 90.0 + a2;
++    const double ha = a1 / kHoursToDegrees + (a2 >= 0.0 ? 6.0 : -6.0);
++    return {wrap_hours(lst - ha), std::clamp(south ? -dec_mech : dec_mech, -90.0, 90.0)};
++}
++
++template <typename Protocol>
++std::pair<AxisParameters, AxisParameters> query_astroeq_axis_parameters(Protocol& protocol) {
++    try {
++        const auto ra = protocol.get_axis_parameters(1);
++        const auto dec = protocol.get_axis_parameters(2);
++        // The reply is an unsigned 24-bit CPR, independent of Home and the
++        // counter period. Do not impose a mount-specific gear-ratio range.
++        for (const auto cpr : {ra.counts_per_revolution, dec.counts_per_revolution}) {
++            if (cpr <= 1 || cpr > kCountsMask) {
++                throw AlpacaException("invalid counts/revolution " + std::to_string(cpr));
++            }
++        }
++        ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQ] axis=1 counts_per_revolution=" +
++            std::to_string(ra.counts_per_revolution));
++        ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQ] axis=2 counts_per_revolution=" +
++            std::to_string(dec.counts_per_revolution));
++        return {ra, dec};
++    } catch (const std::exception& ex) {
++        throw AlpacaException("AstroEQ counts/revolution query failed: " + std::string(ex.what()));
++    } catch (...) {
++        throw AlpacaException("AstroEQ counts/revolution query failed: unknown protocol error");
++    }
++}
++
++struct AstroEqIncrementalMove {
++    uint32_t current;
++    uint32_t target;
++    int32_t delta;
++    uint32_t increment;
++    uint32_t predicted;
++    bool valid;
++    char direction() const { return delta >= 0 ? '0' : '1'; }
++};
++
++AstroEqIncrementalMove astroeq_incremental_move(uint32_t current, double target_axis, uint32_t cpr) {
++    if (cpr == 0 || current > kCountsMask || !std::isfinite(target_axis)) {
++        return {current, 0, 0, 0, 0, false};
++    }
++    // Home-centered machine angles select the intended turn explicitly.
++    // A raw 24-bit counter wraps at 2^24, NOT at counts_per_revolution.
++    // Do not reduce this relative move modulo either period: a GEM flip
++    // can legitimately need more than half a counter range or revolution.
++    const int64_t target = static_cast<int64_t>(kHomeCounts) +
++        std::llround(target_axis / 360.0 * static_cast<double>(cpr));
++    if (target < 0 || target > kCountsMask) {
++        return {current, 0, 0, 0, 0, false};
++    }
++    const int32_t delta = static_cast<int32_t>(target - static_cast<int64_t>(current));
++    const uint32_t increment = static_cast<uint32_t>(std::abs(static_cast<int64_t>(delta)));
++    const char direction = delta >= 0 ? '0' : '1';
++    const int64_t signed_increment = direction == '0' ? static_cast<int64_t>(increment)
++                                                     : -static_cast<int64_t>(increment);
++    const uint32_t predicted = static_cast<uint32_t>(
++        static_cast<int64_t>(current) + signed_increment) & kCountsMask;
++    return {current, static_cast<uint32_t>(target), delta, increment, predicted, increment <= kCountsMask};
++}
++
++struct AstroEqGemCandidate {
++    double axis1;
++    double axis2;
++    double roundtrip_ra;
++    double roundtrip_dec;
++    double travel;
++    bool valid;
++    AstroEqIncrementalMove ra_move{};
++    AstroEqIncrementalMove dec_move{};
++    double error_arcsec = 0.0;
++};
++
++AstroEqGemCandidate astroeq_gem_candidate(double ra, double dec, double lst, bool south,
++                                        bool positive_dec_axis, double current1, double current2,
++                                        uint32_t cpr1, uint32_t cpr2) {
++    const double ha = wrap_hour_angle(lst - ra);
++    const double dec_mech = south ? -dec : dec;
++    // Keep equivalent RA turns inside the centered counter frame before
++    // converting to 24 bits (the counter period is not one revolution).
++    const double a1 = std::remainder(
++        (ha + (positive_dec_axis ? -6.0 : 6.0)) * kHoursToDegrees, 360.0);
++    const double a2 = positive_dec_axis ? 90.0 - dec_mech : dec_mech - 90.0;
++    if (cpr1 == 0 || cpr2 == 0) {
++        return {a1, a2, 0.0, 0.0, 0.0, false};
++    }
++    const auto move1 = astroeq_incremental_move(degrees_to_counts(current1, cpr1), a1, cpr1);
++    const auto move2 = astroeq_incremental_move(degrees_to_counts(current2, cpr2), a2, cpr2);
++    const double landed1 = counts_to_degrees(move1.predicted, cpr1);
++    const double landed2 = counts_to_degrees(move2.predicted, cpr2);
++    const auto [back_ra, back_dec] = astroeq_axes_to_equatorial(landed1, landed2, lst, south);
++    const double ra_error = std::abs(dec) == 90.0 ? 0.0 :
++        std::abs(wrap_hour_angle(back_ra - ra)) * kHoursToDegrees * 3600.0;
++    const double dec_error = std::abs(back_dec - dec) * 3600.0;
++    const double error = std::max(ra_error, dec_error);
++    const bool valid = move1.valid && move2.valid && std::isfinite(error) && error <= 3.0;
++    const double travel = static_cast<double>(move1.increment) * 360.0 / cpr1 +
++                          static_cast<double>(move2.increment) * 360.0 / cpr2;
++    return {landed1, landed2, back_ra, back_dec, travel, valid, move1, move2, error};
++}
++
++double astroeq_angular_error_arcsec(double ra, double dec, double actual_ra, double actual_dec) {
++    constexpr double rad = std::numbers::pi / 180.0;
++    const double delta_ra = wrap_hour_angle(actual_ra - ra) * kHoursToDegrees * rad;
++    const double d1 = dec * rad;
++    const double d2 = actual_dec * rad;
++    const double x = std::cos(d2) * std::sin(delta_ra);
++    const double y = std::cos(d1) * std::sin(d2) - std::sin(d1) * std::cos(d2) * std::cos(delta_ra);
++    const double z = std::sin(d1) * std::sin(d2) + std::cos(d1) * std::cos(d2) * std::cos(delta_ra);
++    return std::atan2(std::hypot(x, y), z) / rad * 3600.0;
++}
++
++// Both hemispheres use the same RA home phase. D=-Dec changes DEC
++// angles in the south, not the counterweight-down RA half revolution.
++bool astroeq_desired_positive_dec_axis(double ha, double current_dec_axis) {
++    constexpr double kMeridianEpsilonHours = 1.0 / (3600.0 * kHoursToDegrees);
++    if (std::abs(ha) < kMeridianEpsilonHours) {
++        return current_dec_axis >= 0.0;
++    }
++    return ha > 0.0;
++}
++
++const AstroEqGemCandidate& select_astroeq_gem_candidate(
++    const AstroEqGemCandidate& positive_side, const AstroEqGemCandidate& negative_side,
++    bool desired_positive) {
++    const auto& selected = desired_positive ? positive_side : negative_side;
++    if (!selected.valid) {
++        // Never fall back to a counterweight-up posture to make a slew pass.
++        const std::string reason = !selected.ra_move.valid || !selected.dec_move.valid
++            ? "target counter or H increment outside 24-bit protocol range"
++            : "predicted landing RA/Dec error exceeds 3 arcsec";
++        ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] REJECT reason=" + reason);
++        throw AlpacaException("AstroEQ GEM: " + reason);
++    }
++    return selected;
++}
++
++
+ }  // namespace
+ 
++int32_t compute_goto_delta_counts(uint32_t current_counts, uint32_t target_counts, uint32_t cpr) {
++    constexpr int64_t kCounterRange = static_cast<int64_t>(kCountsMask) + 1;
++    constexpr int64_t kCounterHalfRange = kCounterRange / 2;
++    int64_t delta = static_cast<int64_t>(target_counts & kCountsMask) -
++                    static_cast<int64_t>(current_counts & kCountsMask);
++    if (delta >= kCounterHalfRange) {
++        delta -= kCounterRange;
++    } else if (delta < -kCounterHalfRange) {
++        delta += kCounterRange;
++    }
++
++    if (cpr != 0) {
++        const int64_t period = static_cast<int64_t>(cpr);
++        delta %= period;
++        const int64_t half_period = period / 2;
++        if (delta > half_period) {
++            delta -= period;
++        } else if (delta < -half_period) {
++            delta += period;
++        }
++    }
++    return static_cast<int32_t>(delta);
++}
++
+ class SkyWatcherTelescopeDriver : public TelescopeDriver, protected alpacacore::AsyncConnectable {
+ public:
+     SkyWatcherTelescopeDriver(int device_number, const ConnectionInfo& connection_info,
+@@ -143,6 +311,12 @@ public:
+           site_latitude_(site_latitude_deg.value_or(0.0)),
+           site_longitude_(site_longitude_deg.value_or(0.0)),
+           site_elevation_m_(site_elevation_m.value_or(0.0)) {
++        // Explicit deployment switch only: no mount identity is inferred from
++        // firmware strings. Unset (or any value other than "1") keeps Wave S.
++        const char* astroeq_goto = std::getenv("ALPACACORE_SKYWATCHER_ASTROEQ_GOTO");
++        if (astroeq_goto != nullptr && std::string_view(astroeq_goto) == "1") {
++            connection_info_.goto_target_mode = GotoTargetMode::Incremental;
++        }
+         guide_rate_.ra = kDefaultGuideRateDegPerSec;
+         guide_rate_.dec = kDefaultGuideRateDegPerSec;
+     }
+@@ -164,7 +338,11 @@ public:
+ 
+     int get_device_number() const override { return device_number_; }
+ 
+-    std::string get_name() const override { return "Sky-Watcher Wave Mount"; }
++    std::string get_name() const override {
++        return connection_info_.goto_target_mode == GotoTargetMode::Incremental
++            ? "AstroEQ Mount"
++            : "Sky-Watcher Wave Mount";
++    }
+ 
+     DeviceType get_device_type() const override { return DeviceType::Telescope; }
+ 
+@@ -219,6 +397,26 @@ public:
+             if (!protocol.connect(connection_info_)) {
+                 throw AlpacaException("Failed to connect to Sky-Watcher motor controller");
+             }
++            const bool astroeq = connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++            if (astroeq) {
++                // Acquire BOTH independent CPRs before publishing Connected or
++                // initializing motor positions; no fixed-CPR fallback is safe.
++                try {
++                    const auto [ra, dec] = query_astroeq_axis_parameters(protocol);
++                    axis_params_[0] = ra;
++                    axis_params_[1] = dec;
++                } catch (...) {
++                    axis_params_[0] = {};
++                    axis_params_[1] = {};
++                    connected_ = false;
++                    reset_runtime_state_locked();
++                    try {
++                        protocol.disconnect();
++                    } catch (...) {  // Preserve the original CPR query error.
++                    }
++                    throw;
++                }
++            }
+             connected_ = true;
+             reset_runtime_state_locked();
+ 
+@@ -230,8 +428,11 @@ public:
+                 // TODO: Confirm ":e" reliability on Wave 100i over both transports.
+             }
+ 
+-            axis_params_[0] = protocol.get_axis_parameters(kAxisRa);
+-            axis_params_[1] = protocol.get_axis_parameters(kAxisDec);
++            if (!astroeq) {
++                // Original Wave initialization order and protocol behavior.
++                axis_params_[0] = protocol.get_axis_parameters(kAxisRa);
++                axis_params_[1] = protocol.get_axis_parameters(kAxisDec);
++            }
+ 
+             // Feature inquiry (":q" data 0x000001): bit 0x04 = home index
+             // sensor. Wave 100i reports it on both axes (0x100C); older
+@@ -351,7 +552,8 @@ public:
+ 
+     bool get_at_home() const override {
+         std::lock_guard<std::mutex> lock(mutex_);
+-        return at_home_;
++        check_connected();
++        return evaluate_at_home_locked(false);
+     }
+ 
+     bool get_at_park() const override {
+@@ -596,7 +798,7 @@ public:
+         (void)dec;
+         std::lock_guard<std::mutex> lock(mutex_);
+         check_connected();
+-        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now(), site_longitude_);
++        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now() + utc_offset_, site_longitude_);
+         double ha = wrap_hour_angle(lst - ra);
+         return ha >= 0.0 ? 0 : 1;
+     }
+@@ -621,7 +823,7 @@ public:
+ 
+     double get_sidereal_time() const override {
+         std::lock_guard<std::mutex> lock(mutex_);
+-        return compute_local_sidereal_time_hours(std::chrono::system_clock::now(), site_longitude_);
++        return compute_local_sidereal_time_hours(std::chrono::system_clock::now() + utc_offset_, site_longitude_);
+     }
+ 
+     double get_site_elevation() const override { return site_elevation_m_; }
+@@ -785,19 +987,59 @@ public:
+                     // True AutoHome: hunt the home index sensors and re-anchor
+                     // the count frame to the physical home mark.
+                     run_autohome(lock);
+-                    set_tracking_locked(lock, false);
+-                    refresh_position_cache_locked(true);
+-                    at_home_ = true;
++                } else if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++                    run_astroeq_count_home_locked(lock);
+                 } else {
+                     // No sensors: goto the power-on index (counts kHomeCounts).
++                    const bool astroeq_incremental =
++                        connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++                    auto& protocol = SkyWatcherProtocolWrapper::instance();
++                    auto read_home_errors = [&]() {
++                        const uint32_t ra_counts = protocol.inquire_position(kAxisRa);
++                        const uint32_t dec_counts = protocol.inquire_position(kAxisDec);
++                        const uint32_t ra_error = static_cast<uint32_t>(std::abs(
++                            static_cast<int64_t>(compute_goto_delta_counts(
++                                ra_counts, kHomeCounts,
++                                axis_params_[0].counts_per_revolution))));
++                        const uint32_t dec_error = static_cast<uint32_t>(std::abs(
++                            static_cast<int64_t>(compute_goto_delta_counts(
++                                dec_counts, kHomeCounts,
++                                axis_params_[1].counts_per_revolution))));
++                        return std::pair<uint32_t, uint32_t>{ra_error, dec_error};
++                    };
++                    auto within_home_tolerance = [&](const auto& errors) {
++                        const double tolerance_deg = astroeq_incremental
++                            ? kAstroEqHomeToleranceDeg : kLandingDeadbandDeg;
++                        const uint32_t ra_tolerance = std::max<uint32_t>(
++                            1, static_cast<uint32_t>(std::ceil(tolerance_deg / 360.0 *
++                                axis_params_[0].counts_per_revolution)));
++                        const uint32_t dec_tolerance = std::max<uint32_t>(
++                            1, static_cast<uint32_t>(std::ceil(tolerance_deg / 360.0 *
++                                axis_params_[1].counts_per_revolution)));
++                        return errors.first <= ra_tolerance &&
++                               errors.second <= dec_tolerance;
++                    };
++
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=1 target=" +
++                                                       std::to_string(kHomeCounts));
+                     dispatch_goto_locked(lock, 0.0, 0.0);
+                     wait_for_slew_complete(lock);
+-                    set_tracking_locked(lock, false);
+-                    // Verify we actually landed at home (an AbortSlew mid-home
+-                    // stops the axes wherever they are) before claiming AtHome.
+                     refresh_position_cache_locked(true);
+-                    at_home_ = std::abs(cached_ra_axis_deg_) < 0.1 && std::abs(cached_dec_axis_deg_) < 0.1;
++                    auto errors = read_home_errors();
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=1 RA error_counts=" +
++                                                       std::to_string(errors.first));
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=1 DEC error_counts=" +
++                                                       std::to_string(errors.second));
++                    if (within_home_tolerance(errors)) {
++                        ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=1 AtHome=true");
++                    }
+                 }
++                set_tracking_locked(lock, false);
++                // AtHome represents the live stopped position, not merely a
++                // successful FindHome command. Reuse the normal goto landing
++                // deadband for both axes.
++                refresh_position_cache_locked(true);
++                at_home_ = evaluate_at_home_locked(true);
+                 homing_ = false;
+             } catch (const std::exception& ex) {
+                 homing_ = false;
+@@ -1118,8 +1360,7 @@ public:
+         goto_in_progress_ = true;
+         try {
+             do_slew_to_ra_dec_locked(lock, ra, dec);
+-            wait_for_slew_complete(lock);
+-            refine_goto_landing(lock, ra, dec);
++            complete_goto_landing_locked(lock, ra, dec);
+         } catch (...) {
+             goto_in_progress_ = false;
+             throw;
+@@ -1146,6 +1387,11 @@ public:
+             check_connected();
+             check_not_parked_locked("SlewToCoordinatesAsync");
+             validate_ra_dec(ra, dec, "SlewToCoordinatesAsync");
++            if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++                // Surface deterministic planning failures as an Alpaca error,
++                // rather than swallowing them later in the async worker.
++                static_cast<void>(ra_dec_to_axis_degrees_locked(ra, dec, 0.0, true));
++            }
+             invalidate_position_cache_locked();
+             slewing_cached_ = true;
+             slew_force_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+@@ -1182,8 +1428,7 @@ public:
+                 dispatch_predicted_goto_locked(lock, ra, dec);
+                 // Poll for completion so tracking restarts after the goto —
+                 // releasing the mutex between polls so GETs stay responsive.
+-                wait_for_slew_complete(lock);
+-                refine_goto_landing(lock, ra, dec);
++                complete_goto_landing_locked(lock, ra, dec);
+                 goto_in_progress_ = false;
+                 restore_tracking_after_slew_locked(lock);
+             } catch (const std::exception& ex) {
+@@ -1581,46 +1826,133 @@ private:
+         dt = std::clamp(dt, 0.0, rate_offsets_active_locked() && tracking_ ? 3600.0 : 5.0);
+         double a1 = cached_ra_axis_deg_ + cmd_axis_rate_deg_s_[0] * dt;
+         double a2 = cached_dec_axis_deg_ + cmd_axis_rate_deg_s_[1] * dt;
++        if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++            const double lst = compute_local_sidereal_time_hours(
++                std::chrono::system_clock::now() + utc_offset_, site_longitude_);
++            return astroeq_axes_to_equatorial(a1, a2, lst, hemisphere_south_locked());
++        }
+         double dec = 0.0;
+         double ha_hours = 0.0;
++        const bool astroeq_incremental =
++            connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++
+         if (a2 >= 0.0) {
+             dec = 90.0 - a2;
+-            ha_hours = a1 / kHoursToDegrees;
++            if (astroeq_incremental) {
++                // AstroEQ GEM home: counterweight down / OTA at NCP
++                // corresponds to HA = +6h when RA axis angle is 0 deg.
++                ha_hours = a1 / kHoursToDegrees + 6.0;
++            } else {
++                // Original Sky-Watcher Wave pointing model.
++                ha_hours = a1 / kHoursToDegrees;
++            }
+         } else {
+             dec = 90.0 + a2;
+-            ha_hours = a1 / kHoursToDegrees - 12.0;
++            if (astroeq_incremental) {
++                // Opposite pier branch with the same AstroEQ 90 deg RA phase.
++                ha_hours = a1 / kHoursToDegrees - 6.0;
++            } else {
++                // Original Sky-Watcher Wave pointing model.
++                ha_hours = a1 / kHoursToDegrees - 12.0;
++            }
+         }
+         if (hemisphere_south_locked()) {
+             dec = -dec;
+         }
+-        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now(), site_longitude_);
++        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now() + utc_offset_, site_longitude_);
+         double ra = wrap_hours(lst - ha_hours);
+         return {ra, std::clamp(dec, -90.0, 90.0)};
+     }
+ 
+     std::pair<double, double> ra_dec_to_axis_degrees_locked(double ra, double dec,
+-                                                            double lst_advance_hours = 0.0) const {
++                                                            double lst_advance_hours = 0.0,
++                                                            bool select_counterweight_down = false) const {
+         double lst =
+-            compute_local_sidereal_time_hours(std::chrono::system_clock::now(), site_longitude_) + lst_advance_hours;
++            compute_local_sidereal_time_hours(std::chrono::system_clock::now() + utc_offset_, site_longitude_) + lst_advance_hours;
++        if (select_counterweight_down && connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++            // Read both counters for incremental validation and flip detection.
++            auto& protocol = SkyWatcherProtocolWrapper::instance();
++            const double current1 = counts_to_degrees(protocol.inquire_position(kAxisRa),
++                                                       axis_params_[0].counts_per_revolution);
++            const double current2 = counts_to_degrees(protocol.inquire_position(kAxisDec),
++                                                       axis_params_[1].counts_per_revolution);
++            const double ha = wrap_hour_angle(lst - ra);
++            const bool desired_positive = astroeq_desired_positive_dec_axis(ha, current2);
++            const auto a = astroeq_gem_candidate(ra, dec, lst, hemisphere_south_locked(), true,
++                current1, current2, axis_params_[0].counts_per_revolution, axis_params_[1].counts_per_revolution);
++            const auto b = astroeq_gem_candidate(ra, dec, lst, hemisphere_south_locked(), false,
++                current1, current2, axis_params_[0].counts_per_revolution, axis_params_[1].counts_per_revolution);
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] requested RA=" + std::to_string(ra) +
++                " Dec=" + std::to_string(dec) + " HA=" + std::to_string(wrap_hour_angle(lst - ra)) +
++                " current axis1=" + std::to_string(current1) + " axis2=" + std::to_string(current2));
++            const auto trace = [](const char* name, const AstroEqGemCandidate& c) {
++                ALPACA_LOG_WARN("SkyWatcher", std::string("[GOTO][GEM] candidate ") + name +
++                    " axis1=" + std::to_string(c.axis1) + " axis2=" + std::to_string(c.axis2) +
++                    " roundtrip RA=" + std::to_string(c.roundtrip_ra) + " Dec=" + std::to_string(c.roundtrip_dec) +
++                    " travel=" + std::to_string(c.travel) + " valid=" + std::to_string(c.valid));
++                const auto trace_move = [](const char* axis, const AstroEqIncrementalMove& m) {
++                    ALPACA_LOG_WARN("SkyWatcher", std::string("[GOTO][GEM] current ") + axis +
++                        " counter=" + std::to_string(m.current) + " target " + axis + " counter=" +
++                        std::to_string(m.target) + " signed delta=" + std::to_string(m.delta) +
++                        " G direction=" + std::string(1, m.direction()) + " H increment=" +
++                        std::to_string(m.increment) + " predicted " + axis + " counter=" +
++                        std::to_string(m.predicted));
++                };
++                trace_move("RA", c.ra_move);
++                trace_move("DEC", c.dec_move);
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] predicted RA=" + std::to_string(c.roundtrip_ra) +
++                    " predicted DEC=" + std::to_string(c.roundtrip_dec) + " target error=" +
++                    std::to_string(c.error_arcsec) + " arcsec");
++            };
++            trace("A", a);
++            trace("B", b);
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] HA=" + std::to_string(ha));
++            ALPACA_LOG_WARN("SkyWatcher", std::string("[GOTO][GEM] target side=") +
++                (ha < 0.0 ? "east" : "west"));
++            ALPACA_LOG_WARN("SkyWatcher", std::string("[GOTO][GEM] desired solution=") +
++                (desired_positive ? "positive-dec-axis" : "negative-dec-axis"));
++            const auto& selected = select_astroeq_gem_candidate(a, b, desired_positive);
++            ALPACA_LOG_WARN("SkyWatcher", std::string("[GOTO][GEM] selected candidate=") +
++                (&selected == &a ? "A" : "B"));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] counterweight-down solution selected");
++            ALPACA_LOG_WARN("SkyWatcher", desired_positive != (current2 >= 0.0)
++                ? "[GOTO][GEM] meridian flip required" : "[GOTO][GEM] meridian flip not required");
++            return {selected.axis1, selected.axis2};
++        }
+         double ha = wrap_hour_angle(lst - ra);
+         double dec_mech = hemisphere_south_locked() ? -dec : dec;
+         double a1 = 0.0;
+         double a2 = 0.0;
++        const bool astroeq_incremental =
++            connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++
+         if (ha >= 0.0) {
+             // pierEast branch
+             a2 = 90.0 - dec_mech;
+-            a1 = ha * kHoursToDegrees;
++            if (astroeq_incremental) {
++                // AstroEQ GEM home phase: HA=+6h -> RA axis angle 0 deg.
++                a1 = (ha - 6.0) * kHoursToDegrees;
++            } else {
++                // Original Sky-Watcher Wave pointing model.
++                a1 = ha * kHoursToDegrees;
++            }
+         } else {
+             // pierWest branch
+             a2 = -(90.0 - dec_mech);
+-            a1 = (ha + 12.0) * kHoursToDegrees;
++            if (astroeq_incremental) {
++                // AstroEQ mirror branch, preserving the 90 deg RA home phase.
++                a1 = (ha + 6.0) * kHoursToDegrees;
++            } else {
++                // Original Sky-Watcher Wave pointing model.
++                a1 = (ha + 12.0) * kHoursToDegrees;
++            }
+         }
+         return {a1, a2};
+     }
+ 
+     std::pair<double, double> compute_alt_az_locked() const {
+         auto [ra, dec] = compute_ra_dec_locked();
+-        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now(), site_longitude_);
++        double lst = compute_local_sidereal_time_hours(std::chrono::system_clock::now() + utc_offset_, site_longitude_);
+         double ha_rad = wrap_hour_angle(lst - ra) * kHoursToDegrees * std::numbers::pi / 180.0;
+         double dec_rad = dec * std::numbers::pi / 180.0;
+         double lat_rad = site_latitude_ * std::numbers::pi / 180.0;
+@@ -2093,7 +2425,7 @@ private:
+     }
+ 
+     void dispatch_goto_locked(std::unique_lock<std::mutex>& lock, double target_ra_axis_deg,
+-                              double target_dec_axis_deg) {
++                              double target_dec_axis_deg, bool gem_goto = false) {
+         auto& protocol = SkyWatcherProtocolWrapper::instance();
+         const uint64_t gen = ++motion_generation_;
+         cmd_axis_rate_deg_s_[0] = 0.0;
+@@ -2123,18 +2455,97 @@ private:
+             {kAxisRa, cached_ra_axis_deg_, target_ra_axis_deg},
+             {kAxisDec, cached_dec_axis_deg_, target_dec_axis_deg},
+         };
++        const bool astroeq_gem = gem_goto &&
++            connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++        AstroEqIncrementalMove gem_moves[2]{};
++        if (astroeq_gem) {
++            // Re-plan from fresh stopped counters before issuing either G.
++            // Use exactly the planner already used for candidate validation.
++            for (const auto& plan : plans) {
++                const auto index = static_cast<std::size_t>(plan.channel - 1);
++                gem_moves[index] = astroeq_incremental_move(protocol.inquire_position(plan.channel),
++                    plan.target_deg, axis_params_[index].counts_per_revolution);
++                if (!gem_moves[index].valid) {
++                    ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] REJECT reason=H increment or target outside 24-bit range");
++                    throw AlpacaException("AstroEQ GEM increment is not representable");
++                }
++            }
++            const auto [target_ra, target_dec] = astroeq_axes_to_equatorial(
++                target_ra_axis_deg, target_dec_axis_deg, 0.0, hemisphere_south_locked());
++            const auto [pred_ra, pred_dec] = astroeq_axes_to_equatorial(
++                counts_to_degrees(gem_moves[0].predicted, axis_params_[0].counts_per_revolution),
++                counts_to_degrees(gem_moves[1].predicted, axis_params_[1].counts_per_revolution),
++                0.0, hemisphere_south_locked());
++            const double error = std::max(std::abs(target_dec - pred_dec) * 3600.0,
++                std::abs(target_dec) == 90.0 ? 0.0 :
++                std::abs(wrap_hour_angle(target_ra - pred_ra)) * kHoursToDegrees * 3600.0);
++            if (!std::isfinite(error) || error > 3.0) {
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] REJECT reason=dispatch endpoint error " +
++                    std::to_string(error) + " arcsec exceeds 3 arcsec");
++                throw AlpacaException("AstroEQ GEM dispatch endpoint verification failed");
++            }
++        }
+         for (const auto& plan : plans) {
+-            double delta = plan.target_deg - plan.current_deg;
++            const auto& params = axis_params_[static_cast<std::size_t>(plan.channel - 1)];
++            const auto index = static_cast<std::size_t>(plan.channel - 1);
++            const uint32_t current_counts = astroeq_gem ? gem_moves[index].current
++                : degrees_to_counts(plan.current_deg, params.counts_per_revolution);
++            const uint32_t target_counts = astroeq_gem ? gem_moves[index].target
++                : degrees_to_counts(plan.target_deg, params.counts_per_revolution);
++            const int32_t delta_counts = astroeq_gem
++                ? gem_moves[static_cast<std::size_t>(plan.channel - 1)].delta
++                : compute_goto_delta_counts(current_counts, target_counts, params.counts_per_revolution);
++            const uint32_t increment_counts = static_cast<uint32_t>(std::abs(static_cast<int64_t>(delta_counts)));
++            const char direction = direction_char(static_cast<double>(delta_counts));
++            if (astroeq_gem) {
++                const auto& move = gem_moves[static_cast<std::size_t>(plan.channel - 1)];
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] dispatch axis=" + std::to_string(plan.channel) +
++                    " current counter=" + std::to_string(move.current) + " target counter=" +
++                    std::to_string(move.target) + " signed delta=" + std::to_string(delta_counts) +
++                    " G direction=" + std::string(1, direction) + " H increment=" +
++                    std::to_string(increment_counts) + " predicted counter=" + std::to_string(move.predicted));
++            }
+             // Motion mode '0' = fast GOTO (the controller manages ramp and the
+             // brake point); direction from the signed move.
+-            protocol.set_motion_mode(plan.channel, '0', direction_char(delta));
+-            protocol.set_goto_target(
+-                plan.channel,
+-                degrees_to_counts(plan.target_deg,
+-                                  axis_params_[static_cast<std::size_t>(plan.channel - 1)].counts_per_revolution));
++            protocol.set_motion_mode(plan.channel, '0', direction);
++            if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++                ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] axis=" + std::to_string(plan.channel) +
++                                                   " current=" + std::to_string(current_counts) +
++                                                   " target=" + std::to_string(target_counts) +
++                                                   " delta=" + std::to_string(delta_counts) +
++                                                   " increment=" + std::to_string(increment_counts) +
++                                                   " direction=" + std::string(1, direction) +
++                                                   " mode=0 G=success");
++                protocol.set_goto_target_increment(plan.channel, increment_counts);
++                ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] axis=" + std::to_string(plan.channel) +
++                                                   " H=success increment=" + std::to_string(increment_counts));
++            } else {
++                protocol.set_goto_target(plan.channel, target_counts);
++            }
+         }
+         protocol.start_motion(kAxisRa);
++        if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++            ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] axis=1 J=success");
++        }
+         protocol.start_motion(kAxisDec);
++        if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++            ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] axis=2 J=success");
++            for (int axis = kAxisRa; axis <= kAxisDec; ++axis) {
++                try {
++                    const AxisStatus status = protocol.inquire_status(axis);
++                    const uint32_t position = protocol.inquire_position(axis);
++                    ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] axis=" + std::to_string(axis) +
++                                                       " post-start-position=" + std::to_string(position) +
++                                                       " raw-f=" + status.raw +
++                                                       " running=" + std::to_string(status.running) +
++                                                       " speed_mode=" + std::to_string(status.speed_mode) +
++                                                       " blocked=" + std::to_string(status.blocked));
++                } catch (const std::exception& ex) {
++                    ALPACA_LOG_WARN("SkyWatcher", "[SkyWatcher][AstroEQGoto] post-start status failed: " +
++                                                       std::string(ex.what()));
++                }
++            }
++        }
+     }
+ 
+     // LST advances 24 sidereal hours per sidereal day of SI seconds.
+@@ -2145,6 +2556,7 @@ private:
+     static constexpr double kTrackingResumeSeconds = 0.7;
+     // Landing deadband per axis (~8 arcsec; ConformU checks RA to 10 arcsec).
+     static constexpr double kLandingDeadbandDeg = 8.0 / 3600.0;
++    static constexpr double kAstroEqHomeToleranceDeg = 120.0 / 3600.0;
+ 
+     // First goto aimed at the ARRIVAL-time sky position: estimate the slew
+     // duration from the distance and advance the LST used for the axis
+@@ -2152,11 +2564,215 @@ private:
+     // (~3 arcmin of RA for a long slew on the Wave 100i).
+     void dispatch_predicted_goto_locked(std::unique_lock<std::mutex>& lock, double ra, double dec) {
+         refresh_position_cache_locked(true);
+-        auto [p1, p2] = ra_dec_to_axis_degrees_locked(ra, dec);
++        auto [p1, p2] = ra_dec_to_axis_degrees_locked(ra, dec, 0.0, true);
+         double dist = std::max(std::abs(p1 - cached_ra_axis_deg_), std::abs(p2 - cached_dec_axis_deg_));
+         double est_seconds = dist / kMaxMoveAxisRateDegPerSec + kGotoRampSeconds + kTrackingResumeSeconds;
+-        auto [t1, t2] = ra_dec_to_axis_degrees_locked(ra, dec, est_seconds * kLstHoursPerSecond);
+-        dispatch_goto_locked(lock, t1, t2);
++        auto [t1, t2] = ra_dec_to_axis_degrees_locked(ra, dec, est_seconds * kLstHoursPerSecond, true);
++        dispatch_goto_locked(lock, t1, t2, true);
++        if (connection_info_.goto_target_mode == GotoTargetMode::Incremental) {
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] meridian flip command accepted");
++        }
++    }
++
++    void run_astroeq_count_home_locked(std::unique_lock<std::mutex>& lock) {
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(540);
++        constexpr int max_passes = 4;
++        const uint32_t ra_tolerance = std::max<uint32_t>(1, static_cast<uint32_t>(std::ceil(
++            kAstroEqHomeToleranceDeg / 360.0 * axis_params_[0].counts_per_revolution)));
++        const uint32_t dec_tolerance = std::max<uint32_t>(1, static_cast<uint32_t>(std::ceil(
++            kAstroEqHomeToleranceDeg / 360.0 * axis_params_[1].counts_per_revolution)));
++        auto& protocol = SkyWatcherProtocolWrapper::instance();
++        at_home_ = false;
++        try {
++            // Home owns homing_, not goto_in_progress_. Keep tracking off
++            // throughout every correction and after successful completion.
++            set_tracking_locked(lock, false);
++            slew_force_until_ = std::chrono::steady_clock::time_point::min();
++            ALPACA_LOG_INFO("SkyWatcher", "[HOME] tolerance_counts RA=" + std::to_string(ra_tolerance) +
++                " DEC=" + std::to_string(dec_tolerance));
++            for (int pass = 1; pass <= max_passes; ++pass) {
++                if (slew_task_cancel_.load()) {
++                    throw AlpacaException("AstroEQ FindHome cancelled");
++                }
++                if (std::chrono::steady_clock::now() >= deadline) {
++                    throw AlpacaException("AstroEQ FindHome overall timeout");
++                }
++                const auto measure = [&]() {
++                    const auto ra = astroeq_incremental_move(protocol.inquire_position(kAxisRa),
++                        0.0, axis_params_[0].counts_per_revolution);
++                    const auto dec = astroeq_incremental_move(protocol.inquire_position(kAxisDec),
++                        0.0, axis_params_[1].counts_per_revolution);
++                    if (!ra.valid || !dec.valid) {
++                        throw AlpacaException("AstroEQ FindHome counter target is not representable");
++                    }
++                    return std::pair{ra, dec};
++                };
++                const auto [ra, dec] = measure();
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) +
++                    " current RA counter=" + std::to_string(ra.current) +
++                    " current DEC counter=" + std::to_string(dec.current));
++                if (ra.increment <= ra_tolerance && dec.increment <= dec_tolerance &&
++                    !get_hardware_slewing_locked()) {
++                    at_home_ = true;
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) + " AtHome=true");
++                    return;
++                }
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) +
++                    " target=" + std::to_string(kHomeCounts));
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) +
++                    " RA delta=" + std::to_string(ra.delta) + " DEC delta=" + std::to_string(dec.delta));
++                if (std::chrono::steady_clock::now() >= deadline) {
++                    throw AlpacaException("AstroEQ FindHome overall timeout");
++                }
++                // Reuse the validated raw-counter incremental planner only;
++                // the equatorial GoTo completion/state machine is not called.
++                dispatch_goto_locked(lock, 0.0, 0.0, true);
++                const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
++                    deadline - std::chrono::steady_clock::now());
++                if (remaining <= std::chrono::seconds::zero()) {
++                    throw AlpacaException("AstroEQ FindHome overall timeout");
++                }
++                wait_for_slew_complete(lock, remaining);
++                if (slew_task_cancel_.load() || get_hardware_slewing_locked()) {
++                    throw AlpacaException("AstroEQ FindHome cancelled or axes not stopped");
++                }
++                refresh_position_cache_locked(true);
++                const auto [landed_ra, landed_dec] = measure();
++                if (std::chrono::steady_clock::now() >= deadline) {
++                    throw AlpacaException("AstroEQ FindHome overall timeout");
++                }
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) + " stopped");
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) +
++                    " RA error_counts=" + std::to_string(landed_ra.increment));
++                ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) +
++                    " DEC error_counts=" + std::to_string(landed_dec.increment));
++                if (landed_ra.increment <= ra_tolerance && landed_dec.increment <= dec_tolerance) {
++                    at_home_ = true;
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] pass=" + std::to_string(pass) + " AtHome=true");
++                    return;
++                }
++                if (pass < max_passes) {
++                    ALPACA_LOG_INFO("SkyWatcher", "[HOME] correction required");
++                }
++            }
++            throw AlpacaException("FindHome residual remains outside tolerance after maximum 4 passes");
++        } catch (...) {
++            at_home_ = false;
++            // A deadline/protocol failure must not abandon a running Home.
++            // Cancellation is stopped by the existing abort/reap path.
++            if (connected_ && !slew_task_cancel_.load()) {
++                try {
++                    protocol.instant_stop(kAxisRa);
++                    protocol.instant_stop(kAxisDec);
++                    cmd_axis_rate_deg_s_[0] = 0.0;
++                    cmd_axis_rate_deg_s_[1] = 0.0;
++                } catch (...) {
++                    ALPACA_LOG_WARN("SkyWatcher", "[HOME] failed to stop axes after Home failure");
++                }
++            }
++            throw;
++        }
++    }
++
++    double current_goto_lst_locked() const {
++        return compute_local_sidereal_time_hours(
++            std::chrono::system_clock::now() + utc_offset_, site_longitude_);
++    }
++
++    void complete_goto_landing_locked(std::unique_lock<std::mutex>& lock, double ra, double dec) {
++        if (connection_info_.goto_target_mode != GotoTargetMode::Incremental) {
++            wait_for_slew_complete(lock);
++            refine_goto_landing(lock, ra, dec);
++            return;
++        }
++        // Keep all correction passes inside DST's 600-second monitor.
++        // A measured long AstroEQ flip needs >180 seconds for DEC alone.
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(540);
++        constexpr double tolerance_arcsec = 120.0;
++        auto& protocol = SkyWatcherProtocolWrapper::instance();
++        constexpr int max_passes = 4;
++        for (int pass = 1; pass <= max_passes; ++pass) {
++            if (slew_task_cancel_.load()) {
++                throw AlpacaException("AstroEQ GoTo cancelled");
++            }
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass) + " started");
++            const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
++                deadline - std::chrono::steady_clock::now());
++            if (remaining <= std::chrono::seconds::zero()) {
++                throw AlpacaException("AstroEQ GoTo correction timeout");
++            }
++            // goto_in_progress_ stays true: only the hardware status ends a
++            // pass, never the public Slewing state that spans both passes.
++            wait_for_slew_complete(lock, remaining);
++            if (slew_task_cancel_.load() || get_hardware_slewing_locked()) {
++                throw AlpacaException("AstroEQ GoTo cancelled or axes not stopped");
++            }
++            const uint32_t current_ra = protocol.inquire_position(kAxisRa);
++            const uint32_t current_dec = protocol.inquire_position(kAxisDec);
++            const double axis1 = counts_to_degrees(current_ra, axis_params_[0].counts_per_revolution);
++            const double axis2 = counts_to_degrees(current_dec, axis_params_[1].counts_per_revolution);
++            const double lst = current_goto_lst_locked();
++            const double ha = wrap_hour_angle(lst - ra);
++            const auto [actual_ra, actual_dec] = astroeq_axes_to_equatorial(
++                axis1, axis2, lst, hemisphere_south_locked());
++            const double error = astroeq_angular_error_arcsec(ra, dec, actual_ra, actual_dec);
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass) + " stopped");
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass) +
++                " current RA counter=" + std::to_string(current_ra) +
++                " current DEC counter=" + std::to_string(current_dec));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] latest LST=" + std::to_string(lst) +
++                " latest HA=" + std::to_string(ha) + " angular error=" + std::to_string(error) + " arcsec");
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass) +
++                " angular error=" + std::to_string(error) + " arcsec");
++            if (std::isfinite(error) && error <= tolerance_arcsec) {
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass) + " within tolerance");
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] final angular error=" +
++                    std::to_string(error) + " arcsec");
++                // Restore only after final verification, while the public
++                // goto_in_progress_ flag still hides the inter-pass gap.
++                restore_tracking_after_slew_locked(lock);
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] GoTo complete");
++                return;
++            }
++            if (!std::isfinite(error)) {
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] REJECT reason=non-finite angular error");
++                restore_tracking_after_slew_ = false;
++                throw AlpacaException("AstroEQ GoTo angular error is not finite");
++            }
++            if (pass == max_passes) {
++                ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] REJECT reason=final angular error exceeds 120 arcsec after maximum correction passes");
++                restore_tracking_after_slew_ = false;
++                throw AlpacaException("AstroEQ GoTo final position exceeds 120 arcsec after maximum correction passes");
++            }
++            // Rebuild BOTH solutions from the original celestial target and
++            // a fresh LST immediately before this correction, never the
++            // previous pass's counter target.
++            const double correction_lst = current_goto_lst_locked();
++            const double correction_ha = wrap_hour_angle(correction_lst - ra);
++            const auto positive = astroeq_gem_candidate(ra, dec, correction_lst, hemisphere_south_locked(), true,
++                axis1, axis2, axis_params_[0].counts_per_revolution, axis_params_[1].counts_per_revolution);
++            const auto negative = astroeq_gem_candidate(ra, dec, correction_lst, hemisphere_south_locked(), false,
++                axis1, axis2, axis_params_[0].counts_per_revolution, axis_params_[1].counts_per_revolution);
++            const auto& correction = select_astroeq_gem_candidate(positive, negative,
++                astroeq_desired_positive_dec_axis(correction_ha, axis2));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass + 1) + " correction required");
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass + 1) + " target recomputed");
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] latest LST=" + std::to_string(correction_lst) +
++                " latest HA=" + std::to_string(correction_ha));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass + 1) +
++                " RA delta=" + std::to_string(correction.ra_move.delta));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] pass=" + std::to_string(pass + 1) +
++                " DEC delta=" + std::to_string(correction.dec_move.delta));
++            ALPACA_LOG_WARN("SkyWatcher", "[GOTO][GEM] correction RA target=" +
++                std::to_string(correction.ra_move.target) + " correction DEC target=" +
++                std::to_string(correction.dec_move.target) + " correction RA delta=" +
++                std::to_string(correction.ra_move.delta) + " correction DEC delta=" +
++                std::to_string(correction.dec_move.delta));
++            if (std::chrono::steady_clock::now() >= deadline) {
++                throw AlpacaException("AstroEQ GoTo correction timeout");
++            }
++            dispatch_goto_locked(lock, correction.axis1, correction.axis2, true);
++        }
+     }
+ 
+     // After the first goto lands, close the residual (prediction error) with
+@@ -2171,7 +2787,7 @@ private:
+             refresh_position_cache_locked(true);
+             // Judge the landing against the target ADVANCED by the resume
+             // window -- the mount deliberately lands ahead (see above).
+-            auto [n1, n2] = ra_dec_to_axis_degrees_locked(ra, dec, kTrackingResumeSeconds * kLstHoursPerSecond);
++            auto [n1, n2] = ra_dec_to_axis_degrees_locked(ra, dec, kTrackingResumeSeconds * kLstHoursPerSecond, true);
+             if (std::abs(n1 - cached_ra_axis_deg_) <= kLandingDeadbandDeg &&
+                 std::abs(n2 - cached_dec_axis_deg_) <= kLandingDeadbandDeg) {
+                 break;
+@@ -2232,6 +2848,46 @@ private:
+         return get_hardware_slewing_locked();
+     }
+ 
++    bool evaluate_at_home_locked(bool trace_transition) const {
++        if (get_hardware_slewing_locked()) {
++            at_home_ = false;
++            return false;
++        }
++
++        auto& protocol = SkyWatcherProtocolWrapper::instance();
++        const uint32_t ra_counts = protocol.inquire_position(kAxisRa);
++        const uint32_t dec_counts = protocol.inquire_position(kAxisDec);
++        const bool astroeq_incremental =
++            connection_info_.goto_target_mode == GotoTargetMode::Incremental;
++        const double home_tolerance_deg = astroeq_incremental
++            ? kAstroEqHomeToleranceDeg : kLandingDeadbandDeg;
++        const uint32_t ra_tolerance = std::max<uint32_t>(
++            1, static_cast<uint32_t>(std::ceil(
++                   home_tolerance_deg / 360.0 * axis_params_[0].counts_per_revolution)));
++        const uint32_t dec_tolerance = std::max<uint32_t>(
++            1, static_cast<uint32_t>(std::ceil(
++                   home_tolerance_deg / 360.0 * axis_params_[1].counts_per_revolution)));
++        const uint32_t ra_error = static_cast<uint32_t>(std::abs(static_cast<int64_t>(
++            compute_goto_delta_counts(ra_counts, kHomeCounts,
++                                      axis_params_[0].counts_per_revolution))));
++        const uint32_t dec_error = static_cast<uint32_t>(std::abs(static_cast<int64_t>(
++            compute_goto_delta_counts(dec_counts, kHomeCounts,
++                                      axis_params_[1].counts_per_revolution))));
++        const bool at_home = ra_error <= ra_tolerance && dec_error <= dec_tolerance;
++        if (at_home && trace_transition && !at_home_) {
++            ALPACA_LOG_INFO("SkyWatcher", "[HOME] RA current=" + std::to_string(ra_counts) +
++                                               " error_counts=" + std::to_string(ra_error));
++            ALPACA_LOG_INFO("SkyWatcher", "[HOME] DEC current=" + std::to_string(dec_counts) +
++                                               " error_counts=" + std::to_string(dec_error));
++            ALPACA_LOG_INFO("SkyWatcher", "[HOME] tolerance_counts RA=" +
++                                               std::to_string(ra_tolerance) +
++                                               " DEC=" + std::to_string(dec_tolerance));
++            ALPACA_LOG_INFO("SkyWatcher", "[HOME] AtHome=true");
++        }
++        at_home_ = at_home;
++        return at_home;
++    }
++
+     // Hardware/manual slewing state WITHOUT the parking_ override. The park
+     // task's own wait_for_slew_complete must poll this variant: polling
+     // get_slewing_locked() while parking_ is set can never see "stopped" and
+@@ -2442,8 +3098,8 @@ private:
+ 
+     // Poll for slew completion, RELEASING the mutex around every sleep so a
+     // sync slew/park doesn't block all GETs (project reference pattern).
+-    void wait_for_slew_complete(std::unique_lock<std::mutex>& lock) const {
+-        const auto timeout = std::chrono::seconds(180);
++    void wait_for_slew_complete(std::unique_lock<std::mutex>& lock,
++                                std::chrono::seconds timeout = std::chrono::seconds(180)) const {
+         auto start = std::chrono::steady_clock::now();
+         const auto start_grace = std::chrono::seconds(2);
+         bool saw_slewing = false;
+diff --git a/AlpacaCore/tests/test_astroeq_gem.py b/AlpacaCore/tests/test_astroeq_gem.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b0152d175779ac21bd539d616bde77ae698e174
+--- /dev/null
++++ b/AlpacaCore/tests/test_astroeq_gem.py
+@@ -0,0 +1,468 @@
++#!/usr/bin/env python3
++# AlpacaCore
++# Copyright (c) 2025-2026 Joey Troy and contributors
++# SPDX-License-Identifier: AGPL-3.0-or-later
++"""Compile the production GEM helpers and exercise them without mount I/O.
++
++Run from the repository root: python3 AlpacaCore/tests/test_astroeq_gem.py
++Generated C++ and executable stay in the existing 6801 build directory.
++"""
++from pathlib import Path
++import subprocess
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp').read_text()
++
++def function(name, source=source):
++    start = source.index(name)
++    start = source.rfind('\n', 0, start) + 1
++    opening = source.index('{', start)
++    depth = 1
++    end = opening + 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end] + '\n'
++
++helpers = source[source.index('// AstroEQ uses the same inverse'):source.index('\n}  // namespace\n\nint32_t compute_goto_delta_counts')]
++code = '''#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <iostream>
++#include <stdexcept>
++#include <utility>
++#include <string>
++#include <numbers>
++#define ALPACA_LOG_WARN(component, message) static_cast<void>(message)
++using AlpacaException = std::runtime_error;
++struct AxisParameters {
++    uint32_t counts_per_revolution=0, timer_frequency=0, high_speed_ratio=1;
++};
++constexpr double kHoursToDegrees = 15.0;
++constexpr uint32_t kHomeCounts = 0x800000, kCountsMask = 0xFFFFFF;
++'''
++for name in ('double wrap_hours(', 'double wrap_hour_angle(', 'double counts_to_degrees(',
++             'uint32_t degrees_to_counts(', 'int32_t compute_goto_delta_counts('):
++    code += function(name)
++wrapper_source = (root / 'AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp').read_text()
++code += function('int hex_nibble(', wrapper_source)
++code += r'''struct CprProtocol {
++    std::string replies[2]{"00F0D2", "00F0D2"};
++    std::string commands;
++    int fail_axis=0;
++    static uint32_t decode_u24(const std::string& data);
++    AxisParameters get_axis_parameters(int axis);
++    std::string send_command(char command,int axis) {
++        commands+=command; commands+=static_cast<char>('0'+axis);
++        if(axis==fail_axis) throw AlpacaException("scripted protocol failure");
++        return command=='a'?replies[axis-1]:command=='b'?"40420F":"10";
++    }
++};
++'''
++code += function('uint32_t SkyWatcherProtocolWrapper::decode_u24(',wrapper_source).replace('SkyWatcherProtocolWrapper::','CprProtocol::')
++code += function('AxisParameters SkyWatcherProtocolWrapper::get_axis_parameters(',wrapper_source).replace('SkyWatcherProtocolWrapper::','CprProtocol::')
++code += helpers
++at_home = function('bool evaluate_at_home_locked(')
++tolerance_start = at_home.index('        const uint32_t ra_tolerance =')
++tolerance_end = at_home.index('        const uint32_t ra_error =', tolerance_start)
++code += 'std::pair<uint32_t,uint32_t> home_tolerances(uint32_t ra_cpr,uint32_t dec_cpr) {\n'
++code += 'struct { uint32_t counts_per_revolution; } axis_params_[2]{{ra_cpr},{dec_cpr}};\n'
++code += 'const double home_tolerance_deg=120.0/3600.0;\n'
++code += at_home[tolerance_start:tolerance_end]
++code += 'return {ra_tolerance,dec_tolerance}; }\n'
++code += r'''
++void check(bool ok, const char* message) {
++    if (!ok) throw std::runtime_error(message);
++}
++int main() {
++    constexpr uint32_t cpr = 13824000;
++    constexpr double lst = 10.0;
++    for (bool south : {false, true}) {
++        // Use the visible hemisphere; D=-Dec gives D=+30/+60 in the south.
++        for (double abs_dec : {30.0, 60.0}) {
++            const double dec = south ? -abs_dec : abs_dec;
++            double current1 = 88.75, current2 = -(90.0-abs_dec);
++            for (double ha : {-5.0/60.0, 5.0/60.0, -1.0, 1.0}) {
++                const auto a = astroeq_gem_candidate(lst-ha, dec, lst, south, true,
++                    current1, current2, cpr, cpr);
++                const auto b = astroeq_gem_candidate(lst-ha, dec, lst, south, false,
++                    current1, current2, cpr, cpr);
++                const bool desired = astroeq_desired_positive_dec_axis(ha, current2);
++                check(desired == (ha > 0.0), "wrong counterweight-down side");
++                const auto& selected = select_astroeq_gem_candidate(a,b,desired);
++                check(selected.valid, "selected roundtrip failed");
++                check(&selected == (ha>0.0?&a:&b), "wrong candidate selected");
++                check(std::abs(selected.axis1)<=90.0, "counterweight-up RA position");
++                const double expected1=(ha+(desired?-6.0:6.0))*15.0;
++                const double expected2=desired?90.0-abs_dec:abs_dec-90.0;
++                check(std::abs(selected.axis1-expected1)<1e-8,"incorrect RA axis");
++                check(std::abs(selected.axis2-expected2)<1e-8,"incorrect DEC axis");
++                if(ha==5.0/60.0) {
++                    check(std::abs(selected.axis1-current1+177.5)<1e-8,"RA flip missing");
++                    check(std::abs(selected.axis2-current2-2.0*(90.0-abs_dec))<1e-8,
++                          "complementary DEC flip missing");
++                }
++                std::cout << "south=" << south << " HA=" << ha << " Dec=" << dec
++                    << " selected=" << (desired?"positive":"negative")
++                    << " axes=(" << selected.axis1 << ',' << selected.axis2 << ")"
++                    << " roundtrip=(" << selected.roundtrip_ra << ',' << selected.roundtrip_dec << ")\n";
++                current1=selected.axis1;
++                current2=selected.axis2;
++            }
++        }
++    }
++    constexpr double epsilon=1.0/(3600.0*15.0);
++    check(!astroeq_desired_positive_dec_axis(0.0,-60.0),"zero HA lost negative side");
++    check(astroeq_desired_positive_dec_axis(0.0,60.0),"zero HA lost positive side");
++    check(!astroeq_desired_positive_dec_axis(epsilon*0.5,-60.0),"subarcsec noise flipped");
++    check(astroeq_desired_positive_dec_axis(-epsilon*0.5,60.0),"subarcsec noise flipped");
++    check(astroeq_desired_positive_dec_axis(epsilon*2.0,-60.0),"deadband too wide");
++    check(!astroeq_desired_positive_dec_axis(-epsilon*2.0,60.0),"deadband too wide");
++    auto invalid=astroeq_gem_candidate(9.0,30.0,lst,false,true,75.0,-60.0,cpr,cpr);
++    const auto valid=invalid;
++    invalid.valid=false;
++    bool threw=false;
++    try { select_astroeq_gem_candidate(invalid,valid,true); }
++    catch(const AlpacaException&) { threw=true; }
++    check(threw,"invalid down solution fell back to counterweight-up");
++    // Full wire-direction / unsigned-H / counter endpoint simulation in both directions.
++    for (bool reverse : {false,true}) {
++        const double current1=reverse?-88.75:88.75;
++        const double current2=reverse?60.0:-60.0;
++        const double ha=reverse?-5.0/60.0:5.0/60.0;
++        const auto a=astroeq_gem_candidate(lst-ha,30.0,lst,false,true,current1,current2,cpr,cpr);
++        const auto b=astroeq_gem_candidate(lst-ha,30.0,lst,false,false,current1,current2,cpr,cpr);
++        const auto& selected=select_astroeq_gem_candidate(a,b,astroeq_desired_positive_dec_axis(ha,current2));
++        check(selected.valid,"incremental meridian flip rejected");
++        const AstroEqIncrementalMove moves[]={selected.ra_move,selected.dec_move};
++        for (const auto& m:moves) {
++            const int64_t wire_delta=m.direction()=='0'?static_cast<int64_t>(m.increment):-static_cast<int64_t>(m.increment);
++            const uint32_t landed=static_cast<uint32_t>(static_cast<int64_t>(m.current)+wire_delta)&kCountsMask;
++            check(landed==m.predicted,"wire endpoint differs from validated endpoint");
++            check(m.increment<=0xFFFFFF,"H overflow");
++        }
++        const double ra_move=selected.ra_move.delta*360.0/cpr;
++        const double dec_move=selected.dec_move.delta*360.0/cpr;
++        check(std::abs(ra_move-(reverse?177.5:-177.5))<1e-8,"RA flip movement wrong");
++        check(std::abs(dec_move-(reverse?-120.0:120.0))<1e-8,"DEC flip movement wrong");
++        check(selected.error_arcsec<=3.0,"wire roundtrip error exceeds tolerance");
++        std::cout<<"WIRE reverse="<<reverse<<" RA current="<<moves[0].current<<" target="<<moves[0].target
++            <<" delta="<<moves[0].delta<<" G="<<moves[0].direction()<<" H="<<moves[0].increment
++            <<" predicted="<<moves[0].predicted<<" DEC current="<<moves[1].current<<" target="<<moves[1].target
++            <<" delta="<<moves[1].delta<<" G="<<moves[1].direction()<<" H="<<moves[1].increment
++            <<" predicted="<<moves[1].predicted<<" error="<<selected.error_arcsec<<" arcsec\n";
++    }
++    // Reproduce the actual failed log: DEC requires -8,901,738 counts,
++    // more than half the 24-bit range, but fully representable by one H.
++    const double recorded_ra=18.970257, recorded_dec=-26.172977;
++    const double recorded_lst=recorded_ra-1.463598;
++    const auto recorded=astroeq_gem_candidate(recorded_ra,recorded_dec,recorded_lst,false,false,
++        counts_to_degrees(5569600,cpr),counts_to_degrees(12829304,cpr),cpr,cpr);
++    check(recorded.valid,"recorded real-world flip rejected");
++    check(recorded.dec_move.delta==-8901738,"recorded DEC delta wrong");
++    check(recorded.dec_move.predicted==3927566,"recorded DEC endpoint wrong");
++    check(recorded.error_arcsec<=3.0,"recorded roundtrip error too large");
++    std::cout<<"RECORDED RA target="<<recorded.ra_move.target<<" delta="<<recorded.ra_move.delta
++        <<" DEC target="<<recorded.dec_move.target<<" delta="<<recorded.dec_move.delta
++        <<" error="<<recorded.error_arcsec<<" arcsec\n";
++    check(!astroeq_incremental_move(0,0.0,0).valid,"zero CPR accepted");
++    check(!astroeq_incremental_move(0,1000.0,cpr).valid,"unrepresentable target accepted");
++    check(!astroeq_incremental_move(0x1000000,0.0,cpr).valid,"invalid raw counter accepted");
++    const auto longest=astroeq_incremental_move(0xFFFFFF,counts_to_degrees(0,cpr),cpr);
++    check(longest.valid && longest.increment==0xFFFFFF && longest.predicted==0,"full-width H rejected");
++    // Southern targets with D=-Dec also permit long paired flips.
++    const auto southern=astroeq_gem_candidate(lst-5.0/60.0,30.0,lst,true,true,88.75,-120.0,cpr,cpr);
++    check(southern.valid,"southern long DEC flip rejected");
++    // Fixed celestial target, advanced LST, and measured pass-1 undershoot.
++    const double request_ra=18.935492, request_dec=-25.916852;
++    const double initial_axis=(11194686.0-kHomeCounts)*360.0/cpr;
++    const double start_lst=request_ra+initial_axis/15.0-6.0;
++    const double latest_lst=start_lst+(11219962.0-11194686.0)/cpr*24.0;
++    const auto pass1=astroeq_gem_candidate(request_ra,request_dec,start_lst,false,false,
++        counts_to_degrees(5664545,cpr),counts_to_degrees(12867776,cpr),cpr,cpr);
++    check(pass1.valid && pass1.ra_move.target==11194686 && pass1.dec_move.target==3937401,
++          "initial target reproduction failed");
++    const double landed_ra_axis=counts_to_degrees(11176257,cpr);
++    const double landed_dec_axis=counts_to_degrees(3955832,cpr);
++    const auto [landed_ra,landed_dec]=astroeq_axes_to_equatorial(landed_ra_axis,landed_dec_axis,latest_lst,false);
++    const double pass1_error=astroeq_angular_error_arcsec(request_ra,request_dec,landed_ra,landed_dec);
++    check(pass1_error>120.0,"undershoot did not require correction");
++    const auto pass2=astroeq_gem_candidate(request_ra,request_dec,latest_lst,false,false,
++        landed_ra_axis,landed_dec_axis,cpr,cpr);
++    check(pass2.valid && pass2.ra_move.target==11219962 && pass2.dec_move.target==3937401,
++          "pass2 reused stale target");
++    check(pass2.ra_move.delta==43705 && pass2.dec_move.delta==-18431,"pass2 residual incorrect");
++    const double pass2_error=astroeq_angular_error_arcsec(request_ra,request_dec,pass2.roundtrip_ra,pass2.roundtrip_dec);
++    check(pass2_error<120.0,"corrected endpoint outside tolerance");
++    const auto [later_ra,later_dec]=astroeq_axes_to_equatorial(pass2.axis1,pass2.axis2,latest_lst+2.0*24.0/86164.0905,false);
++    check(astroeq_angular_error_arcsec(request_ra,request_dec,later_ra,later_dec)<120.0,
++          "short pass2 time advance exceeded tolerance");
++    std::cout<<"LANDING initial_RA="<<pass1.ra_move.target<<" latest_RA="<<pass2.ra_move.target
++        <<" RA_delta="<<pass2.ra_move.delta<<" DEC_delta="<<pass2.dec_move.delta
++        <<" pass1_error="<<pass1_error<<" final_error="<<pass2_error<<" arcsec\n";
++    check(CprProtocol::decode_u24("00F0D2")==13824000,"CPR little-endian decode wrong");
++    CprProtocol protocol;
++    protocol.replies[0]="00A08C"; // 0x8CA000 = 9,216,000
++    protocol.replies[1]="0050C3"; // 0xC35000 = 12,800,000
++    const auto [ra_params,dec_params]=query_astroeq_axis_parameters(protocol);
++    check(ra_params.counts_per_revolution==9216000 && dec_params.counts_per_revolution==12800000,
++          "independent controller CPRs lost");
++    check(protocol.commands=="a1b1g1a2b2g2","axis queries missing or repeated");
++    CprProtocol wide;
++    wide.replies[0]="020000";
++    wide.replies[1]="FFFFFF";
++    const auto [smallest,largest]=query_astroeq_axis_parameters(wide);
++    check(smallest.counts_per_revolution==2 && largest.counts_per_revolution==0xFFFFFF,
++          "CPR validation imposed a gear-ratio-specific range");
++    for(const std::string bad:{"000000","010000","ZZ0000","00"}) {
++        for(int axis:{1,2}) {
++            CprProtocol broken;
++            broken.replies[axis-1]=bad;
++            bool rejected=false;
++            try { query_astroeq_axis_parameters(broken); }
++            catch(const AlpacaException& e) {
++                rejected=std::string(e.what()).find("AstroEQ counts/revolution query failed")!=std::string::npos;
++            }
++            check(rejected,"bad CPR silently accepted or fell back");
++        }
++    }
++    for(int axis:{1,2}) {
++        CprProtocol broken; broken.fail_axis=axis;
++        bool rejected=false;
++        try { query_astroeq_axis_parameters(broken); }
++        catch(const AlpacaException&) { rejected=true; }
++        check(rejected,"CPR protocol failure fell back");
++    }
++    for(const auto& pair:{std::pair<uint32_t,uint32_t>{13824000,13824000},
++                         {9216000,9216000},{9216000,12800000}}) {
++        double maximum=0.0;
++        for(bool south:{false,true}) for(bool reverse:{false,true}) {
++            const double h=reverse?-5.0/60.0:5.0/60.0;
++            const double current1=reverse?-88.75:88.75;
++            const double current2=reverse?60.0:-60.0;
++            const double dec=south?-30.0:30.0;
++            const auto a=astroeq_gem_candidate(lst-h,dec,lst,south,true,current1,current2,pair.first,pair.second);
++            const auto b=astroeq_gem_candidate(lst-h,dec,lst,south,false,current1,current2,pair.first,pair.second);
++            const auto& c=select_astroeq_gem_candidate(a,b,astroeq_desired_positive_dec_axis(h,current2));
++            check(c.valid && c.error_arcsec<=3.0,"mixed CPR meridian flip roundtrip failed");
++            check(c.ra_move.target==static_cast<uint32_t>(kHomeCounts+std::llround((reverse?88.75:-88.75)/360.0*pair.first)),
++                  "RA target used wrong CPR");
++            check(c.dec_move.target==static_cast<uint32_t>(kHomeCounts+std::llround((reverse?-60.0:60.0)/360.0*pair.second)),
++                  "DEC target used wrong CPR");
++            check(std::abs(c.ra_move.delta*360.0/pair.first-(reverse?177.5:-177.5))<0.0001,"RA scale wrong");
++            check(std::abs(c.dec_move.delta*360.0/pair.second-(reverse?-120.0:120.0))<0.0001,"DEC scale wrong");
++            maximum=std::max(maximum,c.error_arcsec);
++        }
++        const auto [ra_tol,dec_tol]=home_tolerances(pair.first,pair.second);
++        check(ra_tol==(pair.first==13824000?1280u:854u),"RA AtHome tolerance wrong");
++        check(dec_tol==(pair.second==13824000?1280u:pair.second==9216000?854u:1186u),"DEC AtHome tolerance wrong");
++        check(degrees_to_counts(0,pair.first)==0x800000 && degrees_to_counts(0,pair.second)==0x800000,"Home changed with CPR");
++        std::cout<<"CPR RA="<<pair.first<<" DEC="<<pair.second<<" flip_max_error="<<maximum
++                 <<" home_tolerance="<<ra_tol<<','<<dec_tol<<"\n";
++    }
++    double max_error = 0.0;
++    int tested = 0;
++    for (bool south : {false, true}) {
++        for (bool positive : {false, true}) {
++            for (double ha = -11.75; ha < 12.0; ha += 0.25) {
++                for (double dec : {-89.9, -60.0, -0.1234, 30.0, 60.0, 89.9, 90.0}) {
++                    const double dm = south ? -dec : dec;
++                    const double current1 = std::remainder((ha+(positive?6.0:-6.0))*15.0,360.0);
++                    const double current2 = positive ? dm-90.0 : 90.0-dm;
++                    const auto c = astroeq_gem_candidate(wrap_hours(lst-ha),dec,lst,south,positive,
++                                                         current1,current2,cpr,cpr);
++                    if (!c.valid) std::cerr << "invalid south=" << south << " positive=" << positive
++                        << " HA=" << ha << " dec=" << dec << " current=" << current1 << ',' << current2
++                        << " endpoint=" << c.axis1 << ',' << c.axis2 << " back=" << c.roundtrip_ra << ','
++                        << c.roundtrip_dec << std::endl;
++                    check(c.valid,"grid roundtrip failed");
++                    const double error = std::abs(wrap_hour_angle(c.roundtrip_ra-wrap_hours(lst-ha)))*15.0;
++                    max_error = std::max(max_error, std::abs(c.roundtrip_dec-dec)*3600.0);
++                    if(std::abs(dec)!=90.0) max_error=std::max(max_error,error*3600.0);
++                    ++tested;
++                }
++            }
++        }
++    }
++    std::cout << "PASS grid=" << tested << " max_error_arcsec=" << max_error << '\n';
++}
++'''
++build = root / 'AlpacaHTTP/build-skywatcher-test'
++cpp = build / 'test_astroeq_gem.cpp'
++binary = build / 'test_astroeq_gem'
++cpp.write_text(code)
++subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror', str(cpp), '-o', str(binary)], check=True)
++subprocess.run([str(binary)], check=True)
++
++
++
++# Compile the actual bounded completion method against a scripted mount.
++state_code = code[:code.index('void check(bool ok')]
++state_code += r"""
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <vector>
++enum class GotoTargetMode { Incremental, Absolute };
++constexpr int kAxisRa=1, kAxisDec=2;
++struct SkyWatcherProtocolWrapper {
++    std::array<uint32_t,2> positions{};
++    static SkyWatcherProtocolWrapper& instance() { static SkyWatcherProtocolWrapper p; return p; }
++    uint32_t inquire_position(int axis) { return positions[axis-1]; }
++};
++struct Frame { uint32_t ra,dec,measure_target,correction_target; };
++struct ScriptedMount {
++    struct { GotoTargetMode goto_target_mode=GotoTargetMode::Incremental; } connection_info_;
++    struct Params { uint32_t counts_per_revolution=13824000; } axis_params_[2];
++    std::atomic<bool> slew_task_cancel_{false};
++    bool restore_tracking_after_slew_=true, goto_in_progress_=true, cancel_wait=false;
++    int waits=0, corrections=0, restores=0, refinements=0;
++    mutable int lst_reads=0;
++    double ra=18.935492, dec=-25.916852;
++    uint32_t target_dec=3937401;
++    std::vector<Frame> frames{{11176257,3955832,11219962,11219962},
++                              {11219962,3937401,11219962,11219962}};
++    std::vector<std::array<int32_t,2>> deltas;
++    std::vector<double> errors;
++    double current_goto_lst_locked() const {
++        const auto& f=frames.at(waits-1);
++        const uint32_t target=lst_reads++==0?f.measure_target:f.correction_target;
++        return ra+(static_cast<double>(target)-8388608.0)/axis_params_[0].counts_per_revolution*24.0-6.0;
++    }
++    bool hemisphere_south_locked() const { return false; }
++    bool get_hardware_slewing_locked() const { return false; }
++    void wait_for_slew_complete(std::unique_lock<std::mutex>&,
++                               std::chrono::seconds timeout=std::chrono::seconds(180)) {
++        if(!goto_in_progress_ || restores) throw std::runtime_error("Slewing or tracking gap");
++        ++waits;
++        if(connection_info_.goto_target_mode==GotoTargetMode::Absolute) return;
++        if(timeout.count()<=205 || timeout.count()>540) throw std::runtime_error("invalid wait budget");
++        const auto& f=frames.at(waits-1);
++        SkyWatcherProtocolWrapper::instance().positions={f.ra,f.dec};
++        lst_reads=0;
++        const double lst=ra+(static_cast<double>(f.measure_target)-8388608.0)/axis_params_[0].counts_per_revolution*24.0-6.0;
++        const auto [r,d]=astroeq_axes_to_equatorial(counts_to_degrees(f.ra,axis_params_[0].counts_per_revolution),
++            counts_to_degrees(f.dec,axis_params_[1].counts_per_revolution),lst,false);
++        errors.push_back(astroeq_angular_error_arcsec(ra,dec,r,d));
++        if(cancel_wait) slew_task_cancel_.store(true);
++    }
++    void refine_goto_landing(std::unique_lock<std::mutex>&,double,double) { ++refinements; }
++    void restore_tracking_after_slew_locked(std::unique_lock<std::mutex>&) {
++        if(!goto_in_progress_ || errors.empty() || errors.back()>120.0)
++            throw std::runtime_error("tracking restored before verified success");
++        ++restores;
++        restore_tracking_after_slew_=false;
++    }
++    void dispatch_goto_locked(std::unique_lock<std::mutex>&,double a1,double a2,bool gem) {
++        if(!goto_in_progress_ || restores || !gem || waits<1 || waits>3)
++            throw std::runtime_error("invalid correction state");
++        ++corrections;
++        const auto& f=frames.at(waits-1);
++        const auto& pos=SkyWatcherProtocolWrapper::instance().positions;
++        const auto m1=astroeq_incremental_move(pos[0],a1,axis_params_[0].counts_per_revolution);
++        const auto m2=astroeq_incremental_move(pos[1],a2,axis_params_[1].counts_per_revolution);
++        if(m1.target!=f.correction_target || m2.target!=target_dec)
++            throw std::runtime_error("stale correction target");
++        deltas.push_back({m1.delta,m2.delta});
++    }
++"""
++completion = function('void complete_goto_landing_locked(')
++assert completion.index('const auto deadline') < completion.index('for (int pass')
++assert completion.count('std::chrono::seconds(540)') == 1
++state_code += completion
++state_code += r"""
++};
++void check_state(bool b,const char* s) { if(!b) throw std::runtime_error(s); }
++int main() {
++    std::mutex mutex;
++    std::unique_lock<std::mutex> lock(mutex);
++    {
++        ScriptedMount m;
++        m.complete_goto_landing_locked(lock,m.ra,m.dec);
++        check_state(m.waits==2 && m.corrections==1 && m.restores==1 && m.goto_in_progress_,"two-pass regression");
++    }
++    {
++        ScriptedMount m;
++        m.frames={{11219962,3937401,11219962,11219962}};
++        m.complete_goto_landing_locked(lock,m.ra,m.dec);
++        check_state(m.waits==1 && m.corrections==0 && m.restores==1,"unnecessary correction");
++    }
++    {
++        // Reproduce the new real-world counters, with advancing LST between
++        // the stop measurement and the next correction planning instant.
++        ScriptedMount m;
++        m.target_dec=3862201;
++        m.dec=90.0+(3862201.0-8388608.0)*360.0/13824000.0;
++        const double initial_lst=m.ra+(10896450.0-8388608.0)/13824000.0*24.0-6.0;
++        const auto primary=astroeq_gem_candidate(m.ra,m.dec,initial_lst,false,false,
++            counts_to_degrees(6003579,13824000),counts_to_degrees(12850016,13824000),13824000,13824000);
++        check_state(primary.valid && primary.ra_move.target==10896450 && primary.dec_move.target==3862201,
++                    "initial pass counter reproduction failed");
++        m.frames={{10878019,3880632,10917769,10917769},
++                  {10911195,3862952,10918221,10920835},
++                  {10919935,3862201,10920987,10920987}};
++        m.complete_goto_landing_locked(lock,m.ra,m.dec);
++        check_state(m.waits==3 && m.corrections==2 && m.restores==1,"pass3 did not complete");
++        check_state(m.deltas[0][0]==39750 && m.deltas[0][1]==-18431,"pass2 delta mismatch");
++        check_state(m.errors[1]>580.0 && m.errors[1]<590.0,"pass2 stop error reproduction failed");
++        check_state(m.deltas[1][0]==9640 && m.deltas[1][1]==-751,"pass3 delta mismatch");
++        check_state(m.errors.back()<=120.0,"final error exceeds tolerance");
++        std::cout<<"REPRO pass1_error="<<m.errors[0]<<" pass2_error="<<m.errors[1]
++            <<" pass3_RA_delta="<<m.deltas[1][0]<<" pass3_DEC_delta="<<m.deltas[1][1]
++            <<" final_error="<<m.errors.back()<<" arcsec\n";
++    }
++    for(const auto& pair:{std::pair<uint32_t,uint32_t>{13824000,13824000},
++                         {9216000,9216000},{9216000,12800000}}) {
++        ScriptedMount m;
++        m.axis_params_[0].counts_per_revolution=pair.first;
++        m.axis_params_[1].counts_per_revolution=pair.second;
++        m.ra=9.0; m.dec=30.0;
++        m.target_dec=degrees_to_counts(-60.0,pair.second);
++        m.frames.clear();
++        for(int pass=1;pass<=4;++pass) {
++            const double target_angle=60.0+pass*0.02;
++            const uint32_t target=degrees_to_counts(target_angle,pair.first);
++            m.frames.push_back({degrees_to_counts(pass==4?target_angle:target_angle-1.0,pair.first),
++                degrees_to_counts(pass==4?-60.0:-59.0,pair.second),target,target});
++        }
++        m.complete_goto_landing_locked(lock,m.ra,m.dec);
++        check_state(m.waits==4 && m.corrections==3 && m.restores==1 && m.errors.back()<=120.0,
++                    "dynamic CPR four-pass completion failed");
++        std::cout<<"FOUR_PASS CPR RA="<<pair.first<<" DEC="<<pair.second
++                 <<" corrections="<<m.corrections<<" final_error="<<m.errors.back()<<"\n";
++    }
++    for(bool succeed_on_fourth:{false,true}) {
++        ScriptedMount m;
++        m.frames={{11176257,3955832,11219962,11219962},
++                  {11176257,3955832,11220962,11220962},
++                  {11176257,3955832,11221962,11221962},
++                  {succeed_on_fourth?11222962u:11176257u,succeed_on_fourth?3937401u:3955832u,11222962,11222962}};
++        bool failed=false;
++        try { m.complete_goto_landing_locked(lock,m.ra,m.dec); }
++        catch(const AlpacaException&) { failed=true; }
++        check_state(m.waits==4 && m.corrections==3,"four-pass limit violated");
++        check_state(failed!=succeed_on_fourth && m.restores==(succeed_on_fourth?1:0),"fourth pass result wrong");
++    }
++    {
++        ScriptedMount m;
++        m.cancel_wait=true;
++        bool failed=false;
++        try { m.complete_goto_landing_locked(lock,m.ra,m.dec); }
++        catch(const AlpacaException&) { failed=true; }
++        check_state(failed && m.waits==1 && m.corrections==0 && m.restores==0,"cancel issued correction");
++    }
++    {
++        ScriptedMount m;
++        m.connection_info_.goto_target_mode=GotoTargetMode::Absolute;
++        m.complete_goto_landing_locked(lock,m.ra,m.dec);
++        check_state(m.waits==1 && m.refinements==1 && m.corrections==0,"Wave path changed");
++    }
++    std::cout<<"PASS production completion: pass1/2/3/4 success, four-pass failure, cancellation, tracking, Wave\n";
++}
++"""
++state_cpp=build/'test_astroeq_landing_state.cpp'
++state_binary=build/'test_astroeq_landing_state'
++state_cpp.write_text(state_code)
++subprocess.run(['c++','-std=c++20','-Wall','-Wextra','-Werror',str(state_cpp),'-o',str(state_binary)],check=True)
++subprocess.run([str(state_binary)],check=True)
+diff --git a/AlpacaCore/tests/test_astroeq_home.py b/AlpacaCore/tests/test_astroeq_home.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c4bcefa5f8ab0ac71bbbaba5c82b97995ded8aee
+--- /dev/null
++++ b/AlpacaCore/tests/test_astroeq_home.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python3
++# AlpacaCore
++# Copyright (c) 2025-2026 Joey Troy and contributors
++# SPDX-License-Identifier: AGPL-3.0-or-later
++"""Hardware-free tests of the production AstroEQ Home completion method."""
++from pathlib import Path
++import subprocess
++
++root=Path(__file__).resolve().parents[2]
++gem=root/'AlpacaCore/tests/test_astroeq_gem.py'
++text=gem.read_text()
++# Reuse the existing extraction of production counter/protocol helpers.
++prefix=text[:text.index("code += r'''\nvoid check(bool ok")]
++context={'__file__':str(gem)}
++exec(compile(prefix,str(gem),'exec'),context)
++source=context['source']
++function=context['function']
++code=context['code']
++code+=r'''
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <vector>
++#define ALPACA_LOG_INFO(component,message) static_cast<void>(message)
++enum class GotoTargetMode { Incremental, Absolute };
++constexpr int kAxisRa=1, kAxisDec=2;
++struct SkyWatcherProtocolWrapper {
++    std::array<uint32_t,2> positions{0x800000+60000,0x800000-90000};
++    int stops=0;
++    static SkyWatcherProtocolWrapper& instance() { static SkyWatcherProtocolWrapper p; return p; }
++    uint32_t inquire_position(int axis) { return positions.at(axis-1); }
++    void instant_stop(int) { ++stops; }
++};
++struct HomeMount {
++    using Clock=std::chrono::steady_clock;
++    struct { GotoTargetMode goto_target_mode=GotoTargetMode::Incremental; } connection_info_;
++    struct Params { uint32_t counts_per_revolution=13824000; } axis_params_[2];
++    static constexpr double kAstroEqHomeToleranceDeg=120.0/3600.0;
++    static constexpr double kLandingDeadbandDeg=8.0/3600.0;
++    std::atomic<bool> slew_task_cancel_{false};
++    bool connected_=true, at_home_=false, homing_=true, goto_in_progress_=false;
++    bool tracking=true, running=false, cancel_wait=false;
++    double cmd_axis_rate_deg_s_[2]{};
++    Clock::time_point slew_force_until_{}, time{};
++    int dispatches=0, waits=0, tracking_calls=0, seconds_per_pass=1;
++    std::vector<std::array<int32_t,2>> landings{{8191,-41000},{319,-9272},{65,-376}};
++    std::vector<std::array<int32_t,2>> deltas;
++    Clock::time_point home_now() const { return time; }
++    bool get_hardware_slewing_locked() const { return running; }
++    void set_tracking_locked(std::unique_lock<std::mutex>&,bool enabled) {
++        if(enabled || !homing_ || goto_in_progress_) throw std::runtime_error("Home state/tracking conflict");
++        tracking=enabled; ++tracking_calls;
++    }
++    void refresh_position_cache_locked(bool force) { if(!force) throw std::runtime_error("stale Home read"); }
++    void dispatch_goto_locked(std::unique_lock<std::mutex>&,double a1,double a2,bool planned=false) {
++        if(!homing_ || goto_in_progress_ || tracking || a1!=0.0 || a2!=0.0)
++            throw std::runtime_error("Home/GoTo state mixed or target changed");
++        if(connection_info_.goto_target_mode==GotoTargetMode::Incremental && !planned)
++            throw std::runtime_error("Home did not use direct incremental planner");
++        auto& proto=SkyWatcherProtocolWrapper::instance();
++        const auto ra=astroeq_incremental_move(proto.positions[0],0.0,axis_params_[0].counts_per_revolution);
++        const auto dec=astroeq_incremental_move(proto.positions[1],0.0,axis_params_[1].counts_per_revolution);
++        if(!ra.valid || !dec.valid || ra.predicted!=0x800000 || dec.predicted!=0x800000)
++            throw std::runtime_error("Home incremental endpoint mismatch");
++        deltas.push_back({ra.delta,dec.delta});
++        running=true; ++dispatches;
++    }
++    void wait_for_slew_complete(std::unique_lock<std::mutex>&,
++                               std::chrono::seconds timeout=std::chrono::seconds(180)) {
++        if(!homing_ || goto_in_progress_ || tracking) throw std::runtime_error("Home state gap");
++        ++waits;
++        if(std::chrono::seconds(seconds_per_pass)>timeout) {
++            time+=timeout+std::chrono::seconds(1);
++            throw AlpacaException("scripted overall timeout");
++        }
++        time+=std::chrono::seconds(seconds_per_pass);
++        auto& pos=SkyWatcherProtocolWrapper::instance().positions;
++        const auto& landing=landings.at(waits-1);
++        pos={static_cast<uint32_t>(0x800000+landing[0]),static_cast<uint32_t>(0x800000+landing[1])};
++        running=false;
++        if(cancel_wait) slew_task_cancel_.store(true);
++    }
++'''
++method=function('void run_astroeq_count_home_locked(')
++assert method.count('std::chrono::seconds(540)')==1
++assert method.index('const auto deadline')<method.index('for (int pass')
++# Substitute only the monotonic clock dependency, so timeout tests are instant.
++code+=method.replace('std::chrono::steady_clock::now()','home_now()')
++# Exercise the retained production Wave count-frame branch separately.
++find_home=function('void find_home(')
++needle='else {\n                    // No sensors: goto the power-on index'
++start=find_home.index(needle)+len('else ')
++end=start+1;depth=1
++while depth:
++    depth+=(find_home[end]=='{')-(find_home[end]=='}')
++    end+=1
++code+='void wave_count_home(std::unique_lock<std::mutex>& lock) '+find_home[start:end]+'\n'
++code+=r'''
++};
++void check(bool b,const char* msg) { if(!b) throw std::runtime_error(msg); }
++void reset(int32_t ra=60000,int32_t dec=-90000) {
++    auto& p=SkyWatcherProtocolWrapper::instance();
++    p.positions={static_cast<uint32_t>(0x800000+ra),static_cast<uint32_t>(0x800000+dec)};
++    p.stops=0;
++}
++int main() {
++    std::mutex mutex; std::unique_lock<std::mutex> lock(mutex);
++    for(int success_pass:{1,2,3,4}) {
++        reset(); HomeMount m;
++        m.landings.assign(success_pass,{8191,-41000});
++        m.landings.back()={65,-376};
++        m.run_astroeq_count_home_locked(lock);
++        check(m.at_home_ && !m.tracking && !m.goto_in_progress_ && m.homing_,"Home success state wrong");
++        check(m.dispatches==success_pass && m.waits==success_pass,"Home pass count wrong");
++        std::cout<<"PASS Home success on pass "<<success_pass<<'\n';
++    }
++    {
++        reset(); HomeMount m;
++        m.run_astroeq_count_home_locked(lock);
++        check(m.dispatches==3 && m.deltas[1][0]==-8191 && m.deltas[1][1]==41000 &&
++              m.deltas[2][0]==-319 && m.deltas[2][1]==9272,"logged residual corrections wrong");
++        check(m.at_home_ && !m.tracking,"logged Home reproduction failed");
++        std::cout<<"REPRO passes=3 pass2_delta=-8191,+41000 pass3_delta=-319,+9272 final_error_counts=65,376\n";
++    }
++    {
++        reset(); HomeMount m; m.landings.assign(4,{8191,-41000});
++        bool failed=false;
++        try { m.run_astroeq_count_home_locked(lock); } catch(const AlpacaException&) { failed=true; }
++        check(failed && m.waits==4 && m.dispatches==4 && !m.at_home_ && !m.tracking,
++              "fourth pass failure not bounded");
++    }
++    for(const auto& initial:{std::array<int32_t,2>{8191,0},{0,-41000},{8191,-41000}}) {
++        reset(initial[0],initial[1]); HomeMount m;
++        m.landings={initial,{65,-376}};
++        m.run_astroeq_count_home_locked(lock);
++        check(m.at_home_ && m.dispatches==2,"single/both-axis correction failed");
++        check(m.deltas[0][0]==-initial[0] && m.deltas[0][1]==-initial[1],"incorrect axis delta");
++    }
++    for(const auto& cpr:{std::pair<uint32_t,uint32_t>{13824000,13824000},{9216000,12800000}}) {
++        reset(1000,-1000); HomeMount m;
++        m.axis_params_[0].counts_per_revolution=cpr.first;
++        m.axis_params_[1].counts_per_revolution=cpr.second;
++        m.landings={{853,-1185}};
++        m.run_astroeq_count_home_locked(lock);
++        check(m.at_home_ && !m.tracking,"independent CPR tolerance failed");
++        check(m.dispatches==(cpr.first==13824000?0:1),"CPR-dependent RA tolerance ignored");
++    }
++    {
++        reset(65,-376); HomeMount m;
++        m.run_astroeq_count_home_locked(lock);
++        check(m.at_home_ && m.dispatches==0 && !m.tracking,"already Home state failed");
++    }
++    {
++        reset(); HomeMount m; m.landings.assign(4,{8191,-41000}); m.seconds_per_pass=205;
++        bool failed=false;
++        try { m.run_astroeq_count_home_locked(lock); } catch(const AlpacaException&) { failed=true; }
++        check(failed && m.dispatches==3 && m.waits==3 && !m.at_home_ && !m.tracking &&
++              SkyWatcherProtocolWrapper::instance().stops==2,"overall deadline reset or failed to stop axes");
++    }
++    {
++        reset(); HomeMount m; m.cancel_wait=true;
++        bool failed=false;
++        try { m.run_astroeq_count_home_locked(lock); } catch(const AlpacaException&) { failed=true; }
++        check(failed && m.dispatches==1 && !m.at_home_ && !m.tracking,"cancelled Home continued");
++    }
++    {
++        reset(); HomeMount m; m.tracking=false;
++        m.connection_info_.goto_target_mode=GotoTargetMode::Absolute;
++        m.landings={{8191,-41000}};
++        m.wave_count_home(lock);
++        check(m.dispatches==1 && m.waits==1,"Wave acquired AstroEQ correction loop");
++    }
++    std::cout<<"PASS four-pass failure, RA/DEC residuals, independent CPRs, already Home, deadline, cancellation, Wave\n";
++}
++'''
++build=root/'AlpacaHTTP/build-skywatcher-test'
++cpp=build/'test_astroeq_home.cpp';binary=build/'test_astroeq_home'
++cpp.write_text(code)
++subprocess.run(['c++','-std=c++20','-Wall','-Wextra','-Werror',str(cpp),'-o',str(binary)],check=True)
++subprocess.run([str(binary)],check=True)
+diff --git a/AlpacaCore/tests/test_skywatcher_serial_detection.py b/AlpacaCore/tests/test_skywatcher_serial_detection.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dad5b5f0cb3cb1236595466c1f0b9f786bee4e48
+--- /dev/null
++++ b/AlpacaCore/tests/test_skywatcher_serial_detection.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++# AlpacaCore
++# Copyright (c) 2025-2026 Joey Troy and contributors
++# SPDX-License-Identifier: AGPL-3.0-or-later
++"""Compile production discovery functions and test serial probing with PTYs.
++
++Run from the repository root. --live additionally enumerates real ports, only
++when /dev/ttyACM0 is unused; no server is started and no motion is commanded.
++"""
++from pathlib import Path
++import os
++import pty
++import select
++import subprocess
++import sys
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp').read_text()
++build = root / 'AlpacaHTTP/build-skywatcher-test'
++
++def function(name):
++    start = source.index(name)
++    start = source.rfind('\n', 0, start) + 1
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end] + '\n'
++
++code = r'''
++#include <alpacacore/util/serial_by_id_scan.h>
++#include <alpacacore/util/serial_io.h>
++#include <alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h>
++#include <chrono>
++#include <filesystem>
++#include <fcntl.h>
++#include <iostream>
++#include <set>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <termios.h>
++#include <unistd.h>
++#include <vector>
++namespace util=alpacacore::util;
++using alpacacore::vendor::skywatcher::SkyWatcherPortInfo;
++constexpr char kFrameEnd='\r', kReplyOk='=';
++#define ALPACA_LOG_INFO(component,message) (std::cout << (message) << std::endl)
++'''
++for name in ('int hex_nibble(', 'std::string format_mc_version(',
++             'bool skywatcher_serial_candidate(', 'std::string parse_skywatcher_serial_probe_reply(',
++             'std::string probe_skywatcher_port(', 'bool raw_port_looks_like_skywatcher_candidate(',
++             'std::vector<SkyWatcherPortInfo> enumerate_skywatcher_ports('):
++    code += function(name)
++code += r'''
++void check(bool b,const char* msg) { if(!b) throw std::runtime_error(msg); }
++int main(int argc,char** argv) {
++    if(argc==2) {
++        if(std::string(argv[1])=="--enumerate") {
++            const auto ports=enumerate_skywatcher_ports();
++            for(const auto& p:ports) std::cout<<"ACCEPTED "<<p.port_path<<'\n';
++            return ports.empty()?2:0;
++        }
++        const auto version=probe_skywatcher_port(argv[1],9600);
++        std::cout<<version<<std::endl;
++        return version.empty()?2:0;
++    }
++    using util::UsbTtyDescriptor;
++    check(skywatcher_serial_candidate({"1a86","wch.cn","USB Serial CH340"}),"CH340 excluded");
++    check(skywatcher_serial_candidate({"0483","STMicroelectronics","STM32 Virtual ComPort"}),"Wave STM32 excluded");
++    check(skywatcher_serial_candidate({"2341","Arduino SA","Mega 2560 R3"}),"Arduino Mega excluded");
++    check(skywatcher_serial_candidate({"2341","",""}),"Arduino VID excluded");
++    check(skywatcher_serial_candidate({"","","Mega_2560"}),"Mega product excluded");
++    for(const std::string token:{"Arduino","Arduino SA","2341","Mega","Mega_2560",
++                                "CH340","CH341","FTDI","CP210","Prolific","STM32"}) {
++        check(skywatcher_serial_candidate({"","usb-"+token+"-if00",""}),"by-id signature excluded");
++    }
++    check(skywatcher_serial_candidate({"","usb-Arduino__www.arduino.cc__0042_9503630343535111B011-if00",""}),
++          "real Mega by-id excluded");
++    check(!skywatcher_serial_candidate({"ffff","Unrelated","GPS receiver"}),"unrelated descriptor admitted");
++    check(parse_skywatcher_serial_probe_reply("=033A44")=="3.58.68","Wave firmware regression");
++    for(const std::string reply:{"","!0","=","=123","=GGGGGG","=033A44junk"})
++        check(parse_skywatcher_serial_probe_reply(reply).empty(),"invalid reply accepted");
++    std::cout<<"PASS descriptor/by-id candidates, Arduino Mega, legacy cables, Wave and invalid MC replies\n";
++}
++'''
++cpp = build / 'test_skywatcher_serial_detection.cpp'
++binary = build / 'test_skywatcher_serial_detection'
++cpp.write_text(code)
++subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror',
++                '-I'+str(root/'AlpacaCore/include'), str(cpp), '-o', str(binary)], check=True)
++subprocess.run([str(binary)], check=True)
++
++for label, reply, accepted in (
++    ('Wave valid MC', b'=033A44\r', True),
++    ('Arduino valid MC', b'=010203\r', True),
++    ('Arduino boot-delay retry', b'RETRY', True),
++    ('unrelated protocol', b'GPS receiver\r', False),
++    ('Arduino without MC reply', None, False),
++    ('invalid MC hex', b'=GGGGGG\r', False),
++    ('unterminated MC reply', b'=033A44', False),
++):
++    master, slave = pty.openpty()
++    proc = subprocess.Popen([str(binary), os.ttyname(slave)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++    try:
++        if not select.select([master], [], [], 5)[0]:
++            raise RuntimeError('Probe sent no command: '+label)
++        command = os.read(master, 1024)
++        if command != b':e1\r':
++            raise RuntimeError('Unexpected probe command: '+repr(command))
++        if reply == b'RETRY':
++            if not select.select([master], [], [], 5)[0]:
++                raise RuntimeError('Missing startup retry')
++            if os.read(master, 1024) != b':e1\r':
++                raise RuntimeError('Unexpected retry command')
++            os.write(master, b'=010203\r')
++        elif reply is not None:
++            os.write(master, reply)
++        stdout, stderr = proc.communicate(timeout=5)
++        if (proc.returncode == 0) != accepted:
++            raise RuntimeError(f'{label}: exit={proc.returncode}, out={stdout!r}, err={stderr!r}')
++        print(f'PASS PTY {label}: '+('accepted' if accepted else 'rejected'))
++    finally:
++        if proc.poll() is None:
++            proc.kill()
++            proc.wait()
++        os.close(master)
++        os.close(slave)
++
++enumeration = function('std::vector<SkyWatcherPortInfo> enumerate_skywatcher_ports(')
++assert enumeration.index('list_serial_by_id') < enumeration.index('raw_candidates')
++assert 'probed.count(resolved)' in enumeration
++assert 'i < 10' in enumeration and '"/dev/ttyACM"' in enumeration and '"/dev/ttyUSB"' in enumeration
++assert enumeration.count('probe_skywatcher_port(resolved, 9600)') == 2
++print('PASS by-id priority, deduplication, raw ACM/USB 0..9 fallback and 9600 baud preserved')
++
++if '--live' in sys.argv:
++    busy = subprocess.run(['fuser', '/dev/ttyACM0'], capture_output=True)
++    if busy.returncode != 1:
++        raise SystemExit('Refusing live probe: ttyACM0 is busy or ownership check failed')
++    subprocess.run([str(binary), '--enumerate'], check=True, timeout=45)
+diff --git a/AlpacaHTTP/src/http/router.cpp b/AlpacaHTTP/src/http/router.cpp
+index 30072c1f2ae8221a2b334c8ce18e2bec9f53bc14..79f2fbbc812377d1d3f6145cfbc7f904850b52f4 100644
+--- a/AlpacaHTTP/src/http/router.cpp
++++ b/AlpacaHTTP/src/http/router.cpp
+@@ -5714,11 +5714,11 @@ Response Router::handle_static_file(const Request& request) {
+ 
+     // Try multiple possible locations for web files
+     std::vector<std::string> possible_roots = {
++        "AlpacaHTTP/web",              // Development repository root
+         "web",                         // Current directory
+         "../web",                      // Parent directory (if running from build/)
+         "../../web",                   // Two levels up
+         "../AlpacaHTTP/web",           // From build directory
+-        "AlpacaHTTP/web",              // Alternative location
+         "/usr/share/alpacabridge/web"  // Packaged install (.deb)
+     };
+ 
+@@ -7148,7 +7148,7 @@ bool Router::register_device_from_config(const nlohmann::json& config, std::stri
+ #endif
+     }
+ 
+-    if (vendor == "skywatcher" && device_type_str == "telescope") {
++    if ((vendor == "skywatcher" || vendor == "astroeq") && device_type_str == "telescope") {
+ #ifdef ALPACACORE_ENABLE_SKYWATCHER
+         std::string conn_type = config.value("connectionType", "auto");
+ 
+@@ -8507,7 +8507,7 @@ nlohmann::json Router::sanitize_device_config(const nlohmann::json& config) cons
+             copy_if_present("host");
+             copy_if_present("tcpPort");
+         }
+-    } else if (vendor == "skywatcher") {
++    } else if (vendor == "skywatcher" || vendor == "astroeq") {
+         copy_if_present("connectionType");
+         copy_if_present("mountIndex");  // same issue-#102 gap as ioptron above
+         copy_if_present("siteLatitude");
+diff --git a/AlpacaHTTP/tests/test_astroeq_ui.js b/AlpacaHTTP/tests/test_astroeq_ui.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..686759c44d3bcfed1e2360aba4ffe7d0c50da1fb
+--- /dev/null
++++ b/AlpacaHTTP/tests/test_astroeq_ui.js
+@@ -0,0 +1,75 @@
++// Run with Node.js; execute the production UI branches without a live server.
++const fs = require('node:fs');
++const vm = require('node:vm');
++const assert = require('node:assert/strict');
++const path = require('node:path');
++const web = process.argv[2] || path.join(__dirname, '..', 'web');
++const source = fs.readFileSync(process.argv[3] ? web : path.join(web, 'app.js'), 'utf8');
++const html = fs.readFileSync(process.argv[3] || path.join(web, 'index.html'), 'utf8');
++assert(html.includes('<option value="astroeq">AstroEQ</option>'));
++assert(html.includes('<option value="skywatcher">Sky-Watcher Wave (Direct)</option>'));
++const options = new Map();
++const fields = new Map();
++const element = id => {
++    if (!fields.has(id)) fields.set(id, {value: '', style: {}, dispatchEvent() {}});
++    return fields.get(id);
++};
++const vendor = element('vendor');
++vendor.querySelector = selector => {
++    if (!options.has(selector)) options.set(selector, {});
++    return options.get(selector);
++};
++const context = {document: {getElementById: element}, Event: class {},
++    normalizeDeviceType: value => value.toLowerCase()};
++vm.createContext(context);
++vm.runInContext(source.slice(source.indexOf('function updateVendorOptions()'),
++    source.indexOf("document.getElementById('device-type').addEventListener")), context);
++for (const type of ['telescope', 'camera', 'focuser', 'switch', 'filterwheel', 'rotator', 'observingconditions', 'covercalibrator']) {
++    element('device-type').value = type;
++    vendor.value = 'astroeq';
++    context.updateVendorOptions();
++    const option = options.get('option[value="astroeq"]');
++    assert.equal(option.hidden, type !== 'telescope');
++    assert.equal(option.disabled, type !== 'telescope');
++    assert.equal(vendor.value, type === 'telescope' ? 'astroeq' : '');
++}
++function branch(prefix, suffix) {
++    const start = source.indexOf(prefix);
++    assert(start >= 0);
++    const end = source.indexOf(suffix, start);
++    assert(end > start);
++    return source.slice(start, end);
++}
++const displayStart = source.indexOf("document.getElementById('vendor').addEventListener('change'");
++const display = source.slice(displayStart, source.indexOf("} else if (vendor === 'celestron')", displayStart));
++for (const name of ['astroeq', 'skywatcher']) {
++    vm.runInContext(`const vendor = '${name}';\n` + display.slice(display.indexOf("if (vendor ===")) + '}', vm.createContext({...context, updateIoptronConfigFields() {}}));
++    assert.equal(element('skywatcher-config').style.display, 'block');
++}
++const serialize = branch("if (deviceData.vendor === 'skywatcher'", " else if (deviceData.vendor === 'onstep')");
++const restore = branch("if (vendor === 'skywatcher' || vendor === 'astroeq')", " else if (vendor === 'onstep')");
++for (const name of ['astroeq', 'skywatcher']) for (const mode of ['auto', 'serial', 'network']) {
++    const input = new Map(Object.entries({skywatcherConnectionType: mode, skywatcherPortPath: '/dev/ttyACM0',
++        skywatcherBaudRate: '9600', skywatcherHost: '192.0.2.1', skywatcherUdpPort: '11880',
++        skywatcherSiteLatitude: '35', skywatcherSiteLongitude: '139', skywatcherSiteElevation: '42'}));
++    const deviceData = {vendor: name};
++    const c = {deviceData, formData: input, parseInt,
++        applyOpticsMm(form, data) {data.apertureDiameter = .2; data.focalLength = 1; return true;},
++        readOptionalNumber(form, key) {return Number(form.get(key));}};
++    vm.runInNewContext(`(function(){${serialize}})()`, c);
++    assert.equal(deviceData.vendor, name);
++    assert.equal(deviceData.connectionType, mode);
++    assert.equal(deviceData.siteLatitude, 35);
++    assert.equal(deviceData.siteLongitude, 139);
++    assert.equal(deviceData.siteElevation, 42);
++    if (mode === 'serial') {assert.equal(deviceData.portPath, '/dev/ttyACM0'); assert.equal(deviceData.baudRate, 9600);}
++    if (mode === 'network') {assert.equal(deviceData.host, '192.0.2.1'); assert.equal(deviceData.udpPort, 11880);}
++    vm.runInNewContext(restore, {...context, vendor: name, config: deviceData,
++        setFormValue(id, value) {element(id).value = value;},
++        opticsMetersToMm(value) {return value * 1000;}, updateApertureAreaFromDiameter() {}});
++    assert.equal(element('skywatcher-connection-type').value, mode);
++    assert.equal(element('skywatcher-site-latitude').value, 35);
++    assert.equal(element('skywatcher-aperture-diameter').value, 200);
++    assert.equal(element('skywatcher-focal-length').value, 1000);
++}
++console.log('PASS: AstroEQ telescope-only, selection reset, shared form, serial/network/auto serialization and edit restoration; Wave regression');
+diff --git a/AlpacaHTTP/tests/test_routing.cpp b/AlpacaHTTP/tests/test_routing.cpp
+index 5844ff2f282e37ba667cc85b715065298471f5d9..1fec8b70cb956643bd84efe4b4c7d7a18d262517 100644
+--- a/AlpacaHTTP/tests/test_routing.cpp
++++ b/AlpacaHTTP/tests/test_routing.cpp
+@@ -1710,6 +1710,67 @@ int main() {
+         EXPECT(cfg.value("udpPort", -1) == 11880);
+         remove_device(router, "skywatcher", "telescope", 9618);
+     }
++    {
++        // astroeq / telescope (direct motor controller) — serial fields,
++        // mountIndex, and the driver-owned site properties must all survive
++        // the sanitize round-trip (the mount stores no site of its own).
++        const auto cfg = roundtrip_config(router,
++                                          {{"vendor", "astroeq"},
++                                           {"deviceType", "telescope"},
++                                           {"deviceNumber", 9717},
++                                           {"connectionType", "serial"},
++                                           {"portPath", "/dev/ttyUSB6"},
++                                           {"baudRate", 9600},
++                                           {"siteLatitude", 39.7392},
++                                           {"siteLongitude", -104.9903},
++                                           {"siteElevation", 1609.0},
++                                           {"mountIndex", 1}},
++                                          "Telescope", 9717);
++        EXPECT(cfg.is_object() && !cfg.empty());
++        EXPECT(cfg.value("vendor", "") == "astroeq");
++        EXPECT(cfg.value("connectionType", "") == "serial");
++        EXPECT(cfg.value("portPath", "") == "/dev/ttyUSB6");
++        EXPECT(cfg.value("baudRate", -1) == 9600);
++        EXPECT(cfg.value("siteLatitude", 0.0) == 39.7392);
++        EXPECT(cfg.value("siteLongitude", 0.0) == -104.9903);
++        EXPECT(cfg.value("siteElevation", 0.0) == 1609.0);
++        EXPECT(cfg.value("mountIndex", -1) == 1);
++        // Keep persisted JSON but recreate the driver via the startup path.
++        EXPECT(alpacacore::management::DeviceRegistry::instance().unregister_device(alpacacore::DeviceType::Telescope, 9717));
++        {
++            alpacahttp::Router reloaded;
++            const auto response = route_request(reloaded, "GET", "/management/v1/configureddevices");
++            const auto payload = nlohmann::json::parse(response.body());
++            bool found = false;
++            for (const auto& entry : payload["Value"]) {
++                if (entry.value("DeviceType", "") == "Telescope" && entry.value("DeviceNumber", -1) == 9717) {
++                    EXPECT(entry["Config"] == cfg);
++                    EXPECT(entry["Config"].value("vendor", "") == "astroeq");
++                    found = true;
++                }
++            }
++            EXPECT(found);
++        }
++        remove_device(router, "astroeq", "telescope", 9717);
++    }
++    {
++        // astroeq / telescope network variant: host + udpPort (UDP 11880,
++        // not tcpPort) must survive.
++        const auto cfg = roundtrip_config(router,
++                                          {{"vendor", "astroeq"},
++                                           {"deviceType", "telescope"},
++                                           {"deviceNumber", 9718},
++                                           {"connectionType", "network"},
++                                           {"host", "192.168.4.1"},
++                                           {"udpPort", 11880}},
++                                          "Telescope", 9718);
++        EXPECT(cfg.is_object() && !cfg.empty());
++        EXPECT(cfg.value("vendor", "") == "astroeq");
++        EXPECT(cfg.value("connectionType", "") == "network");
++        EXPECT(cfg.value("host", "") == "192.168.4.1");
++        EXPECT(cfg.value("udpPort", -1) == 11880);
++        remove_device(router, "astroeq", "telescope", 9718);
++    }
+ #endif
+ 
+ #ifdef ALPACACORE_ENABLE_ONSTEP
+diff --git a/AlpacaHTTP/web/app.js b/AlpacaHTTP/web/app.js
+index 7f32a776ff5bab46d74344661d9d897f6105f790..730fb1669ebe820bd63e94027dc46149a2942cca 100644
+--- a/AlpacaHTTP/web/app.js
++++ b/AlpacaHTTP/web/app.js
+@@ -836,7 +836,7 @@ function startEditDevice(device) {
+         if (synscanConnectionTypeEl) {
+             synscanConnectionTypeEl.dispatchEvent(new Event('change'));
+         }
+-    } else if (vendor === 'skywatcher') {
++    } else if (vendor === 'skywatcher' || vendor === 'astroeq') {
+         const skywatcherConnectionType = config.connectionType || 'auto';
+         setFormValue('skywatcher-connection-type', skywatcherConnectionType);
+         if (skywatcherConnectionType === 'serial') {
+@@ -2065,6 +2065,11 @@ function updateVendorOptions() {
+         skywatcherOption.disabled = !isTelescope;
+         skywatcherOption.hidden = !isTelescope;
+     }
++    const astroeqOption = vendorSelect.querySelector('option[value="astroeq"]');
++    if (astroeqOption) {
++        astroeqOption.disabled = !isTelescope;
++        astroeqOption.hidden = !isTelescope;
++    }
+     const celestronOption = vendorSelect.querySelector('option[value="celestron"]');
+     if (celestronOption) {
+         celestronOption.disabled = !isTelescope;
+@@ -2147,7 +2152,7 @@ function updateVendorOptions() {
+     if (!isTelescope && vendorSelect.value === 'synscan') {
+         vendorSelect.value = '';
+     }
+-    if (!isTelescope && vendorSelect.value === 'skywatcher') {
++    if (!isTelescope && (vendorSelect.value === 'skywatcher' || vendorSelect.value === 'astroeq')) {
+         vendorSelect.value = '';
+     }
+     if (!isTelescope && vendorSelect.value === 'celestron') {
+@@ -2202,7 +2207,7 @@ document.getElementById('vendor').addEventListener('change', function() {
+         updateIoptronConfigFields();
+     } else if (vendor === 'synscan') {
+         document.getElementById('synscan-config').style.display = 'block';
+-    } else if (vendor === 'skywatcher') {
++    } else if (vendor === 'skywatcher' || vendor === 'astroeq') {
+         document.getElementById('skywatcher-config').style.display = 'block';
+     } else if (vendor === 'celestron') {
+         document.getElementById('celestron-config').style.display = 'block';
+@@ -3205,7 +3210,7 @@ document.getElementById('device-form').addEventListener('submit', async function
+         if (!applyOpticsMm(formData, deviceData, 'synscanApertureDiameter', 'synscanFocalLength')) {
+             return;
+         }
+-    } else if (deviceData.vendor === 'skywatcher') {
++    } else if (deviceData.vendor === 'skywatcher' || deviceData.vendor === 'astroeq') {
+         deviceData.connectionType = formData.get('skywatcherConnectionType') || 'auto';
+         if (deviceData.connectionType === 'serial') {
+             deviceData.portPath = formData.get('skywatcherPortPath');
+diff --git a/AlpacaHTTP/web/index.html b/AlpacaHTTP/web/index.html
+index e97b667e12a0eaaf445f4c9371f3b2b7b140b3e3..cf1c8f1904f89fa6cf32a5af8955634deeda3259 100644
+--- a/AlpacaHTTP/web/index.html
++++ b/AlpacaHTTP/web/index.html
+@@ -84,6 +84,7 @@
+                         <option value="svbony">SVBONY</option>
+                         <option value="synscan">SynScan V3/V4</option>
+                         <option value="skywatcher">Sky-Watcher Wave (Direct)</option>
++                        <option value="astroeq">AstroEQ</option>
+                         <option value="touptek">ToupTek</option>
+                         <option value="wandererastro">WandererAstro</option>
+                         <option value="weewx">WeeWX</option>

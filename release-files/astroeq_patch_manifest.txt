@@ -1,0 +1,20 @@
+OpenAstro / AlpacaBridge AstroEQ public patch
+Generated: 2026-09-09T20:43:43+09:00
+Base commit: 77a618be12e9605a158ba119859482566ae098ee
+Anchor commit: dc38d29
+
+Included paths:
+  AlpacaCore/src/vendors/skywatcher/skywatcher_telescope_driver.cpp
+  AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_telescope_driver.h
+  AlpacaCore/src/vendors/skywatcher/skywatcher_protocol_wrapper.cpp
+  AlpacaCore/include/alpacacore/vendor/skywatcher/skywatcher_protocol_wrapper.h
+  AlpacaCore/tests/test_astroeq_gem.py
+  AlpacaCore/tests/test_astroeq_home.py
+  AlpacaCore/tests/test_skywatcher_serial_detection.py
+  AlpacaHTTP/web/index.html
+  AlpacaHTTP/web/app.js
+  AlpacaHTTP/src/http/router.cpp
+  AlpacaHTTP/tests/test_routing.cpp
+  AlpacaHTTP/tests/test_astroeq_ui.js
+
+42fcba92228d0a6a66b4a9963e03d89366fbf1f0166943655f96d7c8244e0773  /home/astro/AlpacaBridge-main/AlpacaBridge-main/astroeq_patch_output/openastro_astroeq_full.patch
